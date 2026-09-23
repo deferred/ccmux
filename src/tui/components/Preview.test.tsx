@@ -77,6 +77,119 @@ describe("Preview", () => {
     expect(frame).toContain("~/Code/myapp");
   });
 
+  it("shows the session summary on its own header line", async () => {
+    const home = process.env.HOME || "";
+    const frame = await renderPreview(
+      mockEnrichedSession({
+        project: "myapp",
+        cwd: `${home}/Code/myapp`,
+        summary: "Detect themes across projects",
+        tmuxTarget: "dev:1",
+        tmuxPane: "%1",
+      }),
+    );
+    const lines = frame.split("\n");
+    const summaryLine = lines.findIndex((l) =>
+      l.includes("Detect themes across projects"),
+    );
+    expect(summaryLine).toBeGreaterThan(-1);
+    const projectLine = lines.findIndex((l) => l.includes("myapp"));
+    expect(projectLine).toBeGreaterThan(-1);
+    expect(projectLine).toBeLessThan(summaryLine);
+    expect(lines[summaryLine + 1]).toContain("~/Code/myapp");
+    const metadataLine = lines.findIndex((l) => l.includes("dev:1"));
+    expect(metadataLine).toBe(summaryLine + 2);
+    expect(lines[metadataLine + 1]).toContain("───");
+  });
+
+  it("keeps the four-row header when the agent publishes no summary", async () => {
+    const home = process.env.HOME || "";
+    const frame = await renderPreview(
+      mockEnrichedSession({
+        project: "myapp",
+        cwd: `${home}/Code/myapp`,
+        tmuxTarget: "dev:1",
+        tmuxPane: "%1",
+      }),
+    );
+    const lines = frame.split("\n");
+    const projectLine = lines.findIndex((l) => l.includes("myapp"));
+    expect(projectLine).toBeGreaterThan(-1);
+    expect(lines[projectLine + 1]).toContain("~/Code/myapp");
+    const metadataLine = lines.findIndex((l) => l.includes("dev:1"));
+    expect(metadataLine).toBe(projectLine + 2);
+    expect(lines[metadataLine + 1]).toContain("───");
+  });
+
+  it("renders a late-arriving summary in the header", async () => {
+    const home = process.env.HOME || "";
+    const [tick] = createSignal(0);
+    const [session, setSession] = createSignal<EnrichedSession>(
+      mockEnrichedSession({
+        project: "myapp",
+        cwd: `${home}/Code/myapp`,
+        tmuxTarget: "dev:1",
+        tmuxPane: "%1",
+      }),
+    );
+    setup = await testRender(
+      () => (
+        <TickContext.Provider value={{ tick }}>
+          <Preview session={session()} width={40} />
+        </TickContext.Provider>
+      ),
+      { width: 100, height: 15 },
+    );
+    await setup.renderOnce();
+    setSession(
+      mockEnrichedSession({
+        project: "myapp",
+        cwd: `${home}/Code/myapp`,
+        summary: "Arrived-after-mount summary",
+        tmuxTarget: "dev:1",
+        tmuxPane: "%1",
+      }),
+    );
+    await setup.renderOnce();
+    const lines = setup.captureCharFrame().split("\n");
+    const summaryLine = lines.findIndex((l) =>
+      l.includes("Arrived-after-mount summary"),
+    );
+    expect(summaryLine).toBeGreaterThan(-1);
+    expect(lines[summaryLine + 1]).toContain("~/Code/myapp");
+    const metadataLine = lines.findIndex((l) => l.includes("dev:1"));
+    expect(metadataLine).toBe(summaryLine + 2);
+    expect(lines[metadataLine + 1]).toContain("───");
+  });
+
+  it("truncates a summary wider than the header instead of wrapping", async () => {
+    const home = process.env.HOME || "";
+    const long =
+      "Investigate why the flaky auth integration tests fail on windows runners";
+    const frame = await renderPreview(
+      mockEnrichedSession({
+        project: "myapp",
+        cwd: `${home}/Code/myapp`,
+        summary: long,
+        tmuxTarget: "dev:1",
+        tmuxPane: "%1",
+      }),
+      30,
+    );
+    const lines = frame.split("\n");
+    const summaryLine = lines.findIndex((l) =>
+      l.includes("Investigate why the flaky"),
+    );
+    expect(summaryLine).toBeGreaterThan(-1);
+    // Clipped, not wrapped: the tail renders nowhere, and the rows below
+    // the summary keep their slots.
+    expect(lines.some((l) => l.includes("windows runners"))).toBe(false);
+    expect(lines[summaryLine]).toContain("…");
+    expect(lines[summaryLine + 1]).toContain("~/Code/myapp");
+    const metadataLine = lines.findIndex((l) => l.includes("dev:1"));
+    expect(lines[metadataLine + 1]).toContain("───");
+  });
+
   it("shows metadata with branch and version", async () => {
     const frame = await renderPreview(
       mockEnrichedSession({
@@ -221,6 +334,124 @@ describe("Preview", () => {
       mockEnrichedSession({ tmuxPane: "%1", subagents: [] }),
     );
     expect(frame).not.toContain("Agents (");
+  });
+});
+
+describe("Preview header rows (issue #200)", () => {
+  const AUDIT = {
+    project: "api",
+    summary: "Improve narrow terminal layout",
+    cwd: "/tmp/ccmux-tui-audit/api",
+    gitBranch: "feature/worktree-cleanup-5",
+    version: "2.1.263",
+    tmuxTarget: "audit:0.0",
+    tmuxPane: "%1",
+    status: "waiting" as const,
+  };
+
+  async function renderAudit(termWidth: number, previewPct = 40) {
+    const [tick] = createSignal(0);
+    setup = await testRender(
+      () => (
+        <TickContext.Provider value={{ tick }}>
+          <Preview session={mockEnrichedSession(AUDIT)} width={previewPct} />
+        </TickContext.Provider>
+      ),
+      { width: termWidth, height: 30 },
+    );
+    await setup.renderOnce();
+    return setup.captureCharFrame();
+  }
+
+  function expectDistinctHeaderRows(frame: string): void {
+    const lines = frame.split("\n");
+    const projectLine = lines.findIndex(
+      (l) => /api\b/.test(l) && l.includes("waiting"),
+    );
+    const summaryLine = lines.findIndex((l) => l.includes("Improve narrow"));
+    const dirLine = lines.findIndex((l) => l.includes("/tmp/ccmux-tui-audit"));
+    // At 80×40% the header is ~29 columns, so the "-5" suffix is the
+    // first thing truncateText clips. The branch name still identifies
+    // the row.
+    const metaLine = lines.findIndex((l) =>
+      l.includes("feature/worktree-cleanup"),
+    );
+    const sepLine = lines.findIndex((l) => l.includes("───"));
+    expect(projectLine).toBeGreaterThan(-1);
+    expect(summaryLine).toBeGreaterThan(-1);
+    expect(dirLine).toBeGreaterThan(-1);
+    expect(metaLine).toBeGreaterThan(-1);
+    expect(sepLine).toBeGreaterThan(-1);
+    expect(projectLine).toBeLessThan(summaryLine);
+    expect(summaryLine).toBeLessThan(dirLine);
+    expect(dirLine).toBeLessThan(metaLine);
+    expect(metaLine).toBeLessThan(sepLine);
+    // Adjacent, not overlapping: each field owns the next row.
+    expect(summaryLine).toBe(projectLine + 1);
+    expect(dirLine).toBe(summaryLine + 1);
+    expect(metaLine).toBe(dirLine + 1);
+    expect(sepLine).toBe(metaLine + 1);
+    // The reported mashup: directory painted over the title suffix.
+    expect(lines[dirLine]!).not.toContain("layout");
+    expect(lines[dirLine]!).not.toContain("apilayout");
+    expect(lines[summaryLine]!).not.toContain("/tmp/");
+    expect(lines[metaLine]!).not.toContain("───");
+    expect(lines[sepLine]!).not.toContain("feature/worktree");
+  }
+
+  it("keeps title, directory, and metadata on distinct rows at 80/100/120 with 40% preview", async () => {
+    for (const width of [80, 100, 120]) {
+      const frame = await renderAudit(width);
+      expectDistinctHeaderRows(frame);
+      setup.renderer.destroy();
+    }
+  });
+
+  it("does not wrap metadata over the title at the 100x30 40% reproduction", async () => {
+    const frame = await renderAudit(100);
+    expect(frame).not.toContain("apilayout");
+    expectDistinctHeaderRows(frame);
+    const lines = frame.split("\n");
+    const dirLine = lines.find((l) => l.includes("/tmp/ccmux-tui-audit"));
+    expect(dirLine).toContain("/tmp/ccmux-tui-audit/api");
+    // Long metadata is clipped to the header width, not wrapped onto
+    // the separator (the wrap that used to steal the title's row).
+    const metaLine = lines.find((l) => l.includes("feature/worktree-cleanup"));
+    expect(metaLine).toBeDefined();
+    expect(metaLine!).toContain("…");
+    expect(metaLine!).not.toContain("1.263");
+  });
+
+  it("truncates a long project name instead of shrinking the status badge", async () => {
+    // Both cells of the first header row were unbounded, so a 40-column
+    // project name shrank the badge and clipped "waiting" off the end.
+    const longProject = "ccmux-worktree-with-a-really-long-name-x";
+    const [tick] = createSignal(0);
+    setup = await testRender(
+      () => (
+        <TickContext.Provider value={{ tick }}>
+          <Preview
+            session={mockEnrichedSession({
+              ...AUDIT,
+              project: longProject,
+            })}
+            width={40}
+          />
+        </TickContext.Provider>
+      ),
+      { width: 80, height: 30 },
+    );
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    const headerRow = frame
+      .split("\n")
+      .find((l) => l.includes("ccmux-worktree"));
+    expect(headerRow).toBeDefined();
+    // Icon and word both intact at the end of the row.
+    expect(headerRow!).toMatch(/\S waiting\s*$/);
+    // The name is what gives instead.
+    expect(headerRow!).toContain("…");
+    expect(headerRow!).not.toContain(longProject);
   });
 });
 

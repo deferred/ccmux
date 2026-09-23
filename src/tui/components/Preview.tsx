@@ -8,7 +8,7 @@ import {
   Show,
   onCleanup,
 } from "solid-js";
-import { useTerminalDimensions } from "@opentui/solid";
+import { useSharedTerminalDimensions } from "../utils/use-shared-dimensions";
 import type {
   StyledText,
   TextRenderable,
@@ -33,7 +33,10 @@ import {
   formatRelativeTime,
   formatSubagentName,
   formatVersion,
+  displayWidth,
   shortenCwd,
+  truncateMiddle,
+  truncateText,
 } from "../utils/format";
 
 /**
@@ -233,7 +236,7 @@ interface PreviewProps {
 }
 
 export const Preview: Component<PreviewProps> = (props) => {
-  const dims = useTerminalDimensions();
+  const dims = useSharedTerminalDimensions();
   const separatorWidth = createMemo(() =>
     Math.max(1, Math.floor((dims().width * props.width) / 100) - 3),
   );
@@ -408,10 +411,34 @@ export const Preview: Component<PreviewProps> = (props) => {
     return s.status === "idle" && attn ? "done" : (eff?.status ?? "");
   };
 
+  /**
+   * What the project name may spend on the header's first row.
+   *
+   * Both cells of that row used to be unbounded, so Yoga's default shrink
+   * split the overflow between them and a long project name ate the status
+   * badge. The badge is the row's fixed part (it is what the row exists to
+   * report), so it keeps its width and the name truncates into whatever is
+   * left, one column of gap included. Every other header row is already
+   * truncated to `separatorWidth`; this is the one that was not.
+   */
+  const statusBadge = createMemo(() => `${statusIcon()} ${statusText()}`);
+
+  const projectWidth = createMemo(() =>
+    Math.max(1, separatorWidth() - displayWidth(statusBadge()) - 1),
+  );
+
   /** Live subagents for the Agents section; capped so a large fan-out
    * doesn't crowd out the pane content below. */
   const AGENTS_SHOWN_MAX = 4;
   const liveSubagents = () => props.session?.subagents ?? [];
+
+  /**
+   * The agent's own summary of what this session is doing
+   * (`EnrichedSession.summary`, derived daemon-side from the pane title),
+   * on the agents that publish one. Renders as its own header line so the
+   * preview names the session's work, not just the project it sits in.
+   */
+  const title = () => props.session?.summary ?? null;
 
   const metadataLine = () => {
     const s = props.session;
@@ -446,22 +473,52 @@ export const Preview: Component<PreviewProps> = (props) => {
         when={props.session}
         fallback={<text fg={theme.overlay}>Select a session to preview</text>}
       >
-        <box height={4} flexDirection="column">
-          <box flexDirection="row">
+        {/* Each header field is one locked row. Directory and metadata used
+            to wrap inside a title()?5:4 budget; Yoga then shrank the
+            summary wrapper and the directory painted over the title
+            (`/tmp/.../apilayout`). Truncate to the column and pin
+            height=1 / flexShrink=0 so wrap cannot steal a neighbour. */}
+        <box height={title() ? 5 : 4} flexDirection="column" flexShrink={0}>
+          <box flexDirection="row" height={1} flexShrink={0}>
             <box flexGrow={1}>
-              <text>
-                <b>{props.session!.project}</b>
+              <text fg={theme.text} wrapMode="none">
+                <b>{truncateText(props.session!.project, projectWidth())}</b>
               </text>
             </box>
-            <text fg={statusColor()}>
+            <text fg={statusColor()} wrapMode="none" flexShrink={0}>
               {statusIcon()} {statusText()}
             </text>
           </box>
-          <text fg={theme.subtext}>
-            {shortenCwd(props.session!.paneCwd ?? props.session!.cwd)}
-          </text>
-          <text fg={theme.overlay}>{metadataLine()}</text>
-          <text fg={theme.border}>{"─".repeat(separatorWidth())}</text>
+          {/* Stable wrapper: a summary can land after first render (enrich
+              arrives over SSE), and a bare <Show> mounted late would append
+              to the END of the parent box (opentui insertion anchor),
+              landing the title under the separator. The always-mounted box
+              pins its slot in the column order. Same fix pattern as the
+              transcript slot in BackgroundPeek. height 0 when empty so the
+              four-row header does not keep a blank gap. */}
+          <box height={title() ? 1 : 0} flexDirection="column" flexShrink={0}>
+            <Show when={title()}>
+              <text fg={theme.text} wrapMode="none">
+                {truncateText(title() ?? "", separatorWidth())}
+              </text>
+            </Show>
+          </box>
+          <box height={1} flexShrink={0}>
+            <text fg={theme.subtext} wrapMode="none">
+              {truncateMiddle(
+                shortenCwd(props.session!.paneCwd ?? props.session!.cwd),
+                separatorWidth(),
+              )}
+            </text>
+          </box>
+          <box height={1} flexShrink={0}>
+            <text fg={theme.overlay} wrapMode="none">
+              {truncateText(metadataLine(), separatorWidth())}
+            </text>
+          </box>
+          <box height={1} flexShrink={0}>
+            <text fg={theme.border}>{"─".repeat(separatorWidth())}</text>
+          </box>
         </box>
 
         <Show when={liveSubagents().length > 0}>

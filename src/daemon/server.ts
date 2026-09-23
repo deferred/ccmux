@@ -50,6 +50,7 @@ import {
   MAX_SPAWN_PROMPT_BYTES,
   normalizeBoolean,
   normalizeClientTty,
+  normalizeModel,
   normalizePrompt,
   resolveSpawnFocusArgv,
   normalizeSplit,
@@ -66,11 +67,26 @@ import {
   createWorktree,
   ensureWorktreesExcluded,
   existingWorktreeFor,
+  pickIssueWorktree,
   readCheckoutHead,
   slugForFork,
+  slugForIssue,
+  slugForPR,
   type WorktreeCreation,
 } from "./worktree-create";
+import {
+  branchCheckedOutAt,
+  configurePRBranch,
+  prRepoMismatch,
+  lookupIssue,
+  lookupPR,
+  preparePRBranch,
+  seedPrompt,
+  type PRSource,
+} from "./gh-spawn-source";
 import { getAgents, type AgentDef } from "../lib/agents";
+import { summaryFromPaneTitle } from "../lib/pane-summary";
+import { BUILD_IDENTITY } from "../lib/build-identity";
 import { listSpawnableAgents, spawnBinaryFor } from "../lib/spawnable-agents";
 import {
   getMarkerKey,
@@ -120,6 +136,14 @@ import {
 } from "./worktree-prune";
 import { fetchPrune, listWorktrees, normalizePath } from "./worktree-git";
 import { listAllWorktrees } from "./worktree-list";
+import { listOpenPRs, type OpenPR, type PRListResponse } from "./pr-list";
+import {
+  listOpenIssues,
+  type IssueListResponse,
+  type OpenIssue,
+} from "./issue-list";
+import { RepoAnswerCache } from "./repo-answer-cache";
+import { mapWithConcurrency } from "../lib/concurrency";
 import {
   moveChangesToWorktree,
   readUncommitted,
@@ -133,6 +157,26 @@ import type {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Validate a wire `pr`/`issue` field. Absent stays absent; anything present
+ * must be a positive whole number, because it goes straight into a `gh` argv
+ * and into a directory name.
+ */
+function normalizeIssueNumber(
+  value: unknown,
+  field: string,
+): BuildResult<number | undefined> {
+  if (value === undefined || value === null)
+    return { ok: true, value: undefined };
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    return {
+      ok: false,
+      error: `Invalid '${field}' field: expected a positive whole number`,
+    };
+  }
+  return { ok: true, value };
 }
 
 /**
@@ -344,6 +388,40 @@ const PR_SWEEP_INTERVAL_MS = 2 * 60_000;
  */
 const WORKTREE_FETCH_TTL_MS = 60_000;
 
+/**
+ * How long one repo's open-PR or open-issue list is served from cache.
+ *
+ * Modelled on `worktreeFetchedAt` above, but it caches the ANSWER rather than
+ * rate-limiting a side effect: `GET /prs` and `GET /issues` have nothing to do
+ * but the `gh` call, so a hit has to be able to reply without one. That is
+ * what makes a Tab rescope and a return-open free, which is why the TTL lives
+ * here and no client keeps a cache of its own.
+ */
+const SOURCE_LIST_TTL_MS = 60_000;
+
+/**
+ * A failed list is held for a SHORT window, deliberately shorter than a
+ * success.
+ *
+ * `pr-resolver.ts` backs failures off HARDER than successes, and is right to:
+ * it refreshes in the background, where a doomed retry costs a spawn and buys
+ * nothing. This one is in front of someone who is looking at the error and
+ * fixing it (`gh auth login` in another pane), and their next open of the
+ * panel is the retry. Long enough that a Tab or a reopen a second later does
+ * not re-spawn a doomed `gh`; short enough that the fix shows.
+ */
+const SOURCE_LIST_FAILURE_TTL_MS = 15_000;
+
+/** What one `listOpenPRs` call answers with. */
+type PRListAnswer = Awaited<ReturnType<typeof listOpenPRs>>;
+
+/** What one `listOpenIssues` call answers with. */
+type IssueListAnswer = Awaited<ReturnType<typeof listOpenIssues>>;
+
+/** How many repos one source list asks about at once, matching
+ *  `worktree-list.ts`. Shared by `GET /prs` and `GET /issues`. */
+const SOURCE_REPO_CONCURRENCY = 3;
+
 /** Upper bound on worktrees one prune request may name. Far above any real
  *  repo's worktree count; exists so a malformed body can't ask the daemon to
  *  normalize an unbounded list. */
@@ -487,6 +565,26 @@ export function rejectCrossOriginBrowser(req: Request): Response | null {
 }
 
 /**
+ * One session's normalized pane-title summary, from the pane the caller
+ * already has in hand.
+ *
+ * The single derivation: `enrichSession` puts it on the wire and
+ * `syncPaneSummaries` decides whether a change is worth a broadcast, and if
+ * those two read the title differently a row either never updates or updates
+ * forever.
+ */
+function paneSummaryOf(
+  session: Session,
+  paneInfo: TmuxPane | null | undefined,
+): string | null {
+  return summaryFromPaneTitle(
+    session.agentType,
+    paneInfo?.paneTitle ?? null,
+    paneInfo?.currentPath ?? session.cwd,
+  );
+}
+
+/**
  * HTTP/SSE Server for the daemon
  */
 export class DaemonServer {
@@ -498,6 +596,24 @@ export class DaemonServer {
   private getPaneCache: PaneCacheGetter;
   private getAgentByType: AgentLookup;
   private visibleSessions = new Set<string>();
+  /**
+   * Last NORMALIZED pane-title summary broadcast for each visible session, so
+   * `syncPaneSummaries` can tell a real change from the churn around it.
+   * Keyed by session id, cleared wherever `visibleSessions` is.
+   *
+   * The one invariant: the value recorded here equals what was last put ON
+   * THE WIRE for that session. Three writers keep it, each satisfying that
+   * differently. `recordBroadcast` runs before the enrich on the session-event
+   * arms and in `rebroadcastSession`, reading the same pane cache the enrich
+   * will. `onBranchPRsChanged` records after its await, straight off
+   * `enriched.summary`, because its send is conditional. `syncPaneSummaries`
+   * records the value it just compared.
+   *
+   * The per-client `init` snapshot is deliberately NOT recorded: it reaches
+   * one new client, and recording off it would suppress the broadcast the
+   * other clients still need.
+   */
+  private lastPaneSummary = new Map<string, string | null>();
   /** Rotating start index for `sweepBranchPRs`, see its docstring. */
   private sweepOffset = 0;
   private gitInfoCache = new Map<string, GitInfoCacheEntry>();
@@ -536,6 +652,32 @@ export class DaemonServer {
   private getScanHealth: () => DaemonHealth;
   /** When each repo last had `git fetch --prune` run for a prune scan. */
   private worktreeFetchedAt = new Map<string, number>();
+  /**
+   * One repo's open-PR answer, keyed by repo root.
+   *
+   * The concurrent misses this deduplicates are real and ordinary: a picker
+   * and a sidebar with the panel open at once, a Tab rescope, a close and
+   * reopen on a cold or expired entry, the panel's `r`, and any direct
+   * caller. Why the entry holds the in-flight promise rather than only the
+   * settled result, and every other rule the cache keeps, is documented once
+   * on {@link RepoAnswerCache}.
+   */
+  private prListCache = new RepoAnswerCache<OpenPR[]>({
+    ttlMs: SOURCE_LIST_TTL_MS,
+    failureTtlMs: SOURCE_LIST_FAILURE_TTL_MS,
+  });
+  /**
+   * The same, for open issues, and on the same TTLs.
+   *
+   * A separate instance rather than a shared one keyed by source, so a
+   * refresh of one list cannot evict or re-spawn the other. Issues churn
+   * slower than PRs, but a different number here would be one more thing to
+   * justify with nothing observed to justify it.
+   */
+  private issueListCache = new RepoAnswerCache<OpenIssue[]>({
+    ttlMs: SOURCE_LIST_TTL_MS,
+    failureTtlMs: SOURCE_LIST_FAILURE_TTL_MS,
+  });
   /**
    * Home directory, for the `project` $HOME-boundary guard (S4). A plain
    * field rather than a constructor param, so a test can stub it directly
@@ -700,7 +842,16 @@ export class DaemonServer {
       // enriching every visible session here is sessions × keys calls.
       if (this.effectiveCwd(session, paneCache) !== cwd) continue;
       const enriched = await this.enrichSession(session);
+      // A removal can land during that await, and it clears both sets. Re-read
+      // rather than trusting the pre-await check: otherwise the set below
+      // re-inserts a key nothing ever reaps (the sync iterates visible
+      // sessions only) and the send announces a session that is already gone.
+      if (!this.visibleSessions.has(session.id)) continue;
       if (enriched.gitBranch !== branch) continue;
+      // Recorded off the enriched value rather than through
+      // `recordBroadcast`: the send is conditional, and a session this loop
+      // skips must keep whatever the last real broadcast told the clients.
+      this.lastPaneSummary.set(session.id, enriched.summary);
       this.broadcastEvent({
         type: "session_updated",
         timestamp,
@@ -902,6 +1053,8 @@ export class DaemonServer {
       ...session,
       tmuxTarget,
       paneCwd,
+      paneTitle: paneInfo?.paneTitle ?? null,
+      summary: paneSummaryOf(session, paneInfo),
       // One read, one answer: when git resolved this cwd, the repo name is
       // the main checkout's basename from that SAME read, so `project` and
       // the worktree facts below cannot contradict each other.
@@ -947,11 +1100,88 @@ export class DaemonServer {
   private async rebroadcastSession(sessionId: string): Promise<void> {
     const session = this.sessionManager.getSession(sessionId);
     if (!session || !this.visibleSessions.has(sessionId)) return;
+    this.recordBroadcast(session);
     this.broadcastEvent({
       type: "session_updated",
       timestamp: new Date().toISOString(),
       session: await this.enrichSession(session),
     });
+  }
+
+  /**
+   * Note that every SSE client is about to be told this session's CURRENT
+   * summary, so the next `syncPaneSummaries` does not say it again. Without
+   * this funnel a turn that ends by changing status and title together
+   * broadcast twice, once on the event and once on the next scan.
+   *
+   * Used by the sends whose enriched session is unconditional: the three
+   * session-event arms and `rebroadcastSession`. It is called BEFORE the
+   * enrich each of those awaits, which is what makes it exact rather than
+   * merely close. `enrichSession` reads git, whose cache expires in 30s, so a
+   * send can resolve a whole `git` spawn later than the `syncPaneSummaries`
+   * at the end of the very same scan, and recording after that await would
+   * record a summary read from a later tick's pane cache. Recording before it
+   * lands the value the enrich itself will ship, since both read the pane
+   * cache in this tick. See `lastPaneSummary` for the invariant and for how
+   * the other two writers meet it.
+   */
+  private recordBroadcast(session: Session): void {
+    const paneCache = this.getPaneCache();
+    this.lastPaneSummary.set(
+      session.id,
+      paneSummaryOf(
+        session,
+        session.tmuxPane ? paneCache.get(session.tmuxPane) : null,
+      ),
+    );
+  }
+
+  /**
+   * Re-broadcast every visible session whose agent-written pane-title summary
+   * changed since the last scan.
+   *
+   * The summary is enrichment: it is read off the pane cache in
+   * `enrichSession` and never lands on `Session`, so no tracked-field
+   * comparison in `SessionManager` can see it move. Without this, a row that
+   * is otherwise idle would hold the summary it had when it was last
+   * broadcast for some other reason, and a long-lived sidebar would show the
+   * previous turn's title indefinitely. Exactly the shape `onBranchPRsChanged`
+   * already uses for PR enrichment: enrichment changed, so re-broadcast.
+   *
+   * Compares the NORMALIZED summary, not the raw title. codex and omp rewrite
+   * the title on every spinner frame, so the raw string differs on nearly
+   * every scan tick and this would broadcast the whole roster continuously.
+   *
+   * A session with no recorded value yet is recorded and NOT broadcast: the
+   * `init` that made it visible already carried its current title.
+   *
+   * Runs after the reconcile that may have broadcast the same session for its
+   * own reasons; `recordBroadcast` is what keeps this from saying it twice.
+   *
+   * With no SSE client connected (the daemon's usual state) the whole pass is
+   * skipped, `broadcastEvent`'s own gate one step earlier. Skipping the map
+   * bookkeeping along with it is deliberate and costs nothing: the first sync
+   * that has a client finds `had === true` against a stale recorded value and
+   * ships the accumulated change as ONE broadcast. Redundant, since that
+   * client already read the current summary out of its own `init`, but
+   * bounded at one event per session and self-correcting from there.
+   */
+  syncPaneSummaries(): void {
+    if (this.sseClients.size === 0) return;
+    const paneCache = this.getPaneCache();
+    for (const session of this.sessionManager.getSessions()) {
+      if (!this.visibleSessions.has(session.id)) continue;
+      const summary = paneSummaryOf(
+        session,
+        session.tmuxPane ? paneCache.get(session.tmuxPane) : null,
+      );
+      const had = this.lastPaneSummary.has(session.id);
+      const previous = this.lastPaneSummary.get(session.id) ?? null;
+      this.lastPaneSummary.set(session.id, summary);
+      if (had && previous !== summary) {
+        void this.rebroadcastSession(session.id);
+      }
+    }
   }
 
   private async enrichSessions(
@@ -1100,11 +1330,25 @@ export class DaemonServer {
       // The probe runs first so its outcome, not a stale scan verdict, decides
       // `socketError`: a tmux that has come back up clears the diagnostic here.
       const socketPath = await this.getServerSocketPath();
+      // Sweep first: a handoff that has already expired is not work in
+      // progress, and would otherwise read as busy until the periodic sweep.
+      this.handoffQueue.sweep();
+      // `build` and `busy` are what the CLI's auto-start path reads to decide
+      // whether to replace this daemon (issue #163). Both are additive: a
+      // missing `build` is outdated, and a missing `busy` on an identified
+      // daemon is busy (fail safe — `/invocations` cannot see queued handoffs).
       return Response.json(
         {
           socketPath,
           socketError: this.socketError,
           health: this.getScanHealth(),
+          build: BUILD_IDENTITY,
+          busy: {
+            invocations: this.invocationManager
+              .listInvocations()
+              .filter((record) => record.status === "running").length,
+            handoffs: this.handoffQueue.size(),
+          },
         },
         { headers: corsHeaders },
       );
@@ -1120,6 +1364,14 @@ export class DaemonServer {
 
     if (path === "/search" && req.method === "GET") {
       return await this.handleSearch(url, corsHeaders);
+    }
+
+    if (path === "/prs" && req.method === "GET") {
+      return await this.handlePRList(url, corsHeaders);
+    }
+
+    if (path === "/issues" && req.method === "GET") {
+      return await this.handleIssueList(url, corsHeaders);
     }
 
     if (path === "/worktrees" && req.method === "GET") {
@@ -1564,6 +1816,139 @@ export class DaemonServer {
     }
   }
 
+  /**
+   * `GET /prs` — every open pull request of every repo in scope.
+   *
+   * `repo` and `cwd` mean exactly what they mean on `GET /worktrees` and the
+   * prune scan, and go through the SAME `worktreeRepoRoots`: the panel merges
+   * all three answers into one list, so a repo one of them can see and
+   * another cannot is a section attached to nothing.
+   *
+   * A repo's failure is reported per repo and never fails the response. The
+   * commonest one is structural (a checkout with no GitHub remote sitting
+   * beside one that has), and taking every other repo's list down with it
+   * would empty most of the multi-repo view over a fact about one row.
+   */
+  private async handlePRList(
+    url: URL,
+    headers: Record<string, string>,
+  ): Promise<Response> {
+    try {
+      const sessions = await this.enrichSessions(
+        this.sessionManager.getSessions(),
+      );
+      const repoRoots = await this.worktreeRepoRoots(
+        sessions,
+        url.searchParams.get("repo"),
+        url.searchParams.get("cwd"),
+      );
+      // An EXPLICIT user refresh skips the freshness check, because a refresh
+      // key that answers from a 60s cache is a key that does nothing for the
+      // one thing on this panel that goes stale on its own: a PR merged a
+      // moment ago still reads open. It cannot stampede, because a live call
+      // is still JOINED rather than duplicated, and that is a property of the
+      // entry rather than of the TTL.
+      const refresh = url.searchParams.get("refresh") === "1";
+      const response: PRListResponse = { repos: [], errors: [] };
+      const answers = await mapWithConcurrency(
+        repoRoots,
+        SOURCE_REPO_CONCURRENCY,
+        async (repoRoot) => ({
+          repoRoot,
+          result: await this.openPRsFor(repoRoot, refresh),
+        }),
+      );
+      for (const { repoRoot, result } of answers) {
+        const repoName = basename(repoRoot);
+        if (result.ok) {
+          response.repos.push({ repoRoot, repoName, prs: result.value });
+        } else {
+          response.errors.push({ repoRoot, repoName, error: result.error });
+        }
+      }
+      response.repos.sort((a, b) => a.repoName.localeCompare(b.repoName));
+      return Response.json(response, { headers });
+    } catch (err) {
+      return Response.json(
+        { error: `Failed to list PRs: ${errorMessage(err)}` },
+        { status: 500, headers },
+      );
+    }
+  }
+
+  /** One repo's open PRs, through the cache that is also the per-repo lock. */
+  private openPRsFor(repoRoot: string, refresh = false): Promise<PRListAnswer> {
+    return this.prListCache.answer(repoRoot, refresh, () =>
+      listOpenPRs(repoRoot),
+    );
+  }
+
+  /**
+   * `GET /issues` — every open issue of every repo in scope.
+   *
+   * A structural clone of {@link handlePRList}, down to the scoping knobs and
+   * the per-repo errors, and that is the point: the source picker draws both
+   * lists as one surface, so a repo one endpoint can see and the other cannot
+   * would be a section attached to nothing.
+   *
+   * Deliberately NOT folded into `/prs` as an `include=` parameter. The
+   * panel's PR view is a consumer that would pay for issue data it drops on
+   * the floor; the two lists want independent failure, since a repo with
+   * issues disabled must still be able to answer about its PRs; and `refresh`
+   * stays per source, so refreshing PRs after a merge does not re-spawn a
+   * `gh issue list` too.
+   */
+  private async handleIssueList(
+    url: URL,
+    headers: Record<string, string>,
+  ): Promise<Response> {
+    try {
+      const sessions = await this.enrichSessions(
+        this.sessionManager.getSessions(),
+      );
+      const repoRoots = await this.worktreeRepoRoots(
+        sessions,
+        url.searchParams.get("repo"),
+        url.searchParams.get("cwd"),
+      );
+      const refresh = url.searchParams.get("refresh") === "1";
+      const response: IssueListResponse = { repos: [], errors: [] };
+      const answers = await mapWithConcurrency(
+        repoRoots,
+        SOURCE_REPO_CONCURRENCY,
+        async (repoRoot) => ({
+          repoRoot,
+          result: await this.openIssuesFor(repoRoot, refresh),
+        }),
+      );
+      for (const { repoRoot, result } of answers) {
+        const repoName = basename(repoRoot);
+        if (result.ok) {
+          response.repos.push({ repoRoot, repoName, issues: result.value });
+        } else {
+          response.errors.push({ repoRoot, repoName, error: result.error });
+        }
+      }
+      response.repos.sort((a, b) => a.repoName.localeCompare(b.repoName));
+      return Response.json(response, { headers });
+    } catch (err) {
+      return Response.json(
+        { error: `Failed to list issues: ${errorMessage(err)}` },
+        { status: 500, headers },
+      );
+    }
+  }
+
+  /** One repo's open issues, through its own instance of the same cache. */
+  private openIssuesFor(
+    repoRoot: string,
+    refresh = false,
+  ): Promise<IssueListAnswer> {
+    return this.issueListCache.answer(repoRoot, refresh, () =>
+      listOpenIssues(repoRoot),
+    );
+  }
+
   private async handlePruneCandidates(
     url: URL,
     headers: Record<string, string>,
@@ -1601,6 +1986,7 @@ export class DaemonServer {
     let body: {
       paths?: unknown;
       allowDirty?: unknown;
+      allowEndIdle?: unknown;
       dryRun?: unknown;
       cleanState?: unknown;
       repo?: unknown;
@@ -1652,9 +2038,15 @@ export class DaemonServer {
     if (pathsCapError) return pathsCapError;
     const allowDirtyCapError = overCap(body.allowDirty, "allowDirty entries");
     if (allowDirtyCapError) return allowDirtyCapError;
+    const allowEndIdleCapError = overCap(
+      body.allowEndIdle,
+      "allowEndIdle entries",
+    );
+    if (allowEndIdleCapError) return allowEndIdleCapError;
 
     const paths = asPaths(body.paths);
     const allowDirty = asPaths(body.allowDirty);
+    const allowEndIdle = asPaths(body.allowEndIdle);
     const cleanState = body.cleanState === true;
 
     // Validated the same way the spawn endpoint validates its own pane ids: a
@@ -1714,10 +2106,43 @@ export class DaemonServer {
         // resolved through symlinks, so an opt-in echoed back through a client
         // still matches the candidate it was granted for.
         allowDirtyPaths: allowDirty.map(normalizePath),
+        // The second opt-in, on its own axis: the paths whose idle agent
+        // sessions the caller agreed to end. Normalized like the dirty list.
+        allowEndIdlePaths: allowEndIdle.map(normalizePath),
+        // Read at the moment of removal, not from the scan. The candidate's
+        // sessions were idle when they were listed, and the confirmation that
+        // followed took as long as a user takes; an agent that went back to
+        // work in that window refuses the removal even though its path was
+        // opted in.
+        //
+        // It answers with the pid as well as the status, and the run signals
+        // THAT pid: the reconciler may have moved this row onto a different
+        // process since the scan, and the check and the kill have to be about
+        // one process to mean anything (`handleKillSession` keeps the same
+        // rule for the same reason).
+        //
+        // With the pane and the cwd, because a row moves as well as changes
+        // process. A marker claim re-points a session at whatever pane now
+        // holds it, so an id the scan found in this worktree can be answering
+        // from a sibling checkout by now — idle there, and none of this run's
+        // business. `runPrune` compares the cwd against the worktree it is
+        // removing and signals nothing that has left.
+        liveSession: (id) => {
+          const session = this.sessionManager.getSession(id);
+          return session
+            ? {
+                status: session.status,
+                pid: session.pid,
+                tmuxPane: session.tmuxPane,
+                cwd: session.cwd,
+              }
+            : undefined;
+        },
         // The caller's own pane, exempt from the last-moment occupancy guard
         // so pruning from a pane inside the worktree still works. It never
-        // widens what is prunable: a worktree with a bound session is already
-        // skipped at classification.
+        // widens what is prunable: a worktree with a non-idle session is
+        // already skipped at classification, and an all-idle one is gated on
+        // `allowEndIdle` above.
         callerPane: callerPaneResult.value,
         source: typeof body.source === "string" ? body.source : "api",
       });
@@ -2184,20 +2609,73 @@ export class DaemonServer {
       );
     }
 
+    // Read the pid ONCE: `session` is a live reference the reconciler can
+    // mutate during the wait below, and the process this call signalled is
+    // the only one whose death may remove this row.
+    const pid = session.pid;
+
     try {
-      process.kill(session.pid, "SIGTERM");
+      process.kill(pid, "SIGTERM");
     } catch (err: unknown) {
       if (isErrnoException(err) && err.code === "ESRCH") {
-        // Process already dead — not an error
-      } else {
-        return Response.json(
-          { error: `Failed to kill process: ${errorMessage(err)}` },
-          { status: 500, headers },
-        );
+        // Process already dead. Nothing to wait for, and the row is stale by
+        // definition — remove it now so the client's `x` lands instead of
+        // sitting there until the next scan reaps it.
+        this.sessionManager.removeSession(sessionId);
+        return Response.json({ success: true, killed: true }, { headers });
+      }
+      return Response.json(
+        { error: `Failed to kill process: ${errorMessage(err)}` },
+        { status: 500, headers },
+      );
+    }
+
+    // Removal is DEATH-GATED, not acknowledgement-gated: only once the process
+    // is confirmed gone does the row go, and it goes here (daemon-side) so
+    // every attached client learns about it through the same `session_removed`
+    // broadcast rather than each one guessing locally. A process that outlives
+    // the cap keeps its row and reports `killed: false`; the scan loop's
+    // liveness cleanup owns it from there.
+    const exited = await this.waitForExit(pid, 2000);
+    if (exited) {
+      // A pane-tracked id outlives the process it names: `createPaneTrackedSession`
+      // mutates the row in place when a new agent appears in that pane, so a scan
+      // tick inside the wait can hand this id a live pid that is not the death we
+      // observed. Skip only a DIFFERENT non-null pid — skipping a null one would
+      // reintroduce the lag this handler exists to fix.
+      const current = this.sessionManager.getSession(sessionId);
+      if (!current || current.pid === null || current.pid === pid) {
+        this.sessionManager.removeSession(sessionId);
       }
     }
 
-    return Response.json({ success: true }, { headers });
+    return Response.json({ success: true, killed: exited }, { headers });
+  }
+
+  /**
+   * Poll a pid's liveness until it exits or `timeoutMs` elapses. Returns true
+   * if the process is gone. Signal 0 is the probe: it throws (ESRCH, or EPERM
+   * once the pid is someone else's) exactly when the process we could signal
+   * is no longer there.
+   */
+  private async waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return true; // Process is gone
+      }
+      await Bun.sleep(100);
+    }
+    // Probe once more: the loop exits on the deadline, so without this a
+    // process that died during the final sleep is reported as still running.
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -2236,16 +2714,9 @@ export class DaemonServer {
         }
       }
 
-      // Poll until process exits (up to 5s)
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        try {
-          process.kill(session.pid, 0);
-        } catch {
-          break; // Process is gone
-        }
-        await Bun.sleep(100);
-      }
+      // Poll until process exits (up to 5s). The outcome is deliberately
+      // ignored: a restart re-sends the resume command either way.
+      await this.waitForExit(session.pid, 5000);
     }
 
     // Resume in the same pane via the stable `%N` id, not the cached
@@ -3511,6 +3982,7 @@ export class DaemonServer {
         // (promoted in the "updated" branch).
         if (this.isVisibleSession(session)) {
           this.visibleSessions.add(session.id);
+          this.recordBroadcast(session);
           return {
             type: "session_created",
             timestamp,
@@ -3528,6 +4000,7 @@ export class DaemonServer {
         if (isVisibleNow && !wasVisible) {
           // Pane just assigned — promote to visible as "created"
           this.visibleSessions.add(session.id);
+          this.recordBroadcast(session);
           return {
             type: "session_created",
             timestamp,
@@ -3535,6 +4008,7 @@ export class DaemonServer {
           };
         }
         if (isVisibleNow && wasVisible) {
+          this.recordBroadcast(session);
           return {
             type: "session_updated",
             timestamp,
@@ -3544,6 +4018,7 @@ export class DaemonServer {
         if (!isVisibleNow && wasVisible) {
           // Pane lost — demote from visible
           this.visibleSessions.delete(session.id);
+          this.lastPaneSummary.delete(session.id);
           return {
             type: "session_removed",
             timestamp,
@@ -3558,6 +4033,7 @@ export class DaemonServer {
         const sessionId = event.sessionId!;
         if (this.visibleSessions.has(sessionId)) {
           this.visibleSessions.delete(sessionId);
+          this.lastPaneSummary.delete(sessionId);
           return {
             type: "session_removed",
             timestamp,
@@ -3807,6 +4283,9 @@ export class DaemonServer {
       callerTty?: unknown;
       detach?: unknown;
       worktree?: unknown;
+      pr?: unknown;
+      issue?: unknown;
+      model?: unknown;
     };
     try {
       body = (await req.json()) as typeof body;
@@ -3897,6 +4376,18 @@ export class DaemonServer {
     }
     const prompt = promptResult.value;
 
+    // The value is spliced unquoted into the agent command, so the pattern
+    // check here is what keeps it inert. Whether the agent takes a model
+    // flag at all is the builders' call, once the agent is resolved.
+    const modelResult = normalizeModel(body.model);
+    if (!modelResult.ok) {
+      return Response.json(
+        { error: modelResult.error },
+        { status: 400, headers },
+      );
+    }
+    const model = modelResult.value;
+
     // Every other spawn field goes through a normalizer; `detach` used to be
     // an unchecked cast, so `{"detach":"false"}` (a truthy string) reached
     // tmux as `true`, passing `-d` and suppressing `select-window` — the
@@ -3974,6 +4465,60 @@ export class DaemonServer {
       );
     }
 
+    const prResult = normalizeIssueNumber(body.pr, "pr");
+    if (!prResult.ok) {
+      return Response.json({ error: prResult.error }, { status: 400, headers });
+    }
+    const issueResult = normalizeIssueNumber(body.issue, "issue");
+    if (!issueResult.ok) {
+      return Response.json(
+        { error: issueResult.error },
+        { status: 400, headers },
+      );
+    }
+    // The CLI refuses each of these too, and each is repeated here for the
+    // usual reason: the endpoint is public, the picker will grow its own way
+    // in (issue #151), and every one of them would otherwise be honored
+    // half-way — a name that loses to the derived one, a base that loses to
+    // the PR head, a fork whose source decides the agent AND the checkout.
+    const sourceFlag =
+      prResult.value !== undefined
+        ? "pr"
+        : issueResult.value !== undefined
+          ? "issue"
+          : undefined;
+    if (prResult.value !== undefined && issueResult.value !== undefined) {
+      return Response.json(
+        {
+          error:
+            "'pr' and 'issue' cannot both be set: each brings its own worktree",
+        },
+        { status: 400, headers },
+      );
+    }
+    if (sourceFlag) {
+      const conflict = forkSource
+        ? "fork"
+        : resume != null
+          ? "resume"
+          : worktreeRequest.value?.name !== undefined
+            ? "worktree.name"
+            : worktreeRequest.value?.withChanges
+              ? "worktree.withChanges"
+              : prResult.value !== undefined &&
+                  worktreeRequest.value?.base !== undefined
+                ? "worktree.base"
+                : undefined;
+      if (conflict) {
+        return Response.json(
+          {
+            error: `'${sourceFlag}' cannot be combined with '${conflict}': ${sourceFlag} decides the worktree, its name and where it starts from`,
+          },
+          { status: 400, headers },
+        );
+      }
+    }
+
     // Resolve agent definition (custom agents from config are also valid)
     const agent = this.getAgentByType(agentName);
     if (!agent) {
@@ -3997,6 +4542,65 @@ export class DaemonServer {
       }
     }
 
+    // Resolving the PR or issue HERE, before the command is built, is what
+    // lets its title and URL become the agent's opening prompt: the command
+    // is one string built once, and the worktree block below runs after it.
+    // Both lookups are read-only `gh` calls, so a refusal at this point has
+    // left nothing behind.
+    let prSource: PRSource | undefined;
+    let sourceWorktreeName: string | undefined;
+    let spawnPrompt = prompt;
+    if (sourceFlag) {
+      // Seeded only when the agent can actually be spawned with a prompt.
+      // Every built-in can; a custom agent without `promptCommand` would
+      // otherwise have `--pr` refused outright for a prompt it never asked
+      // for, when the checkout is most of what it wanted. A user-supplied
+      // prompt is left to hit that refusal unchanged.
+      const canSeed = agent.promptCommand !== undefined || prompt !== undefined;
+      if (prResult.value !== undefined) {
+        const found = await lookupPR(cwd, prResult.value);
+        if (!found.ok) {
+          return Response.json(
+            { error: found.error },
+            { status: 400, headers },
+          );
+        }
+        prSource = found.value;
+        sourceWorktreeName = slugForPR(
+          found.value.number,
+          found.value.headRefName,
+        );
+        if (canSeed) {
+          spawnPrompt = seedPrompt(
+            `PR #${found.value.number}`,
+            found.value.title,
+            found.value.url,
+            prompt,
+          );
+        }
+      } else if (issueResult.value !== undefined) {
+        const found = await lookupIssue(cwd, issueResult.value);
+        if (!found.ok) {
+          return Response.json(
+            { error: found.error },
+            { status: 400, headers },
+          );
+        }
+        sourceWorktreeName = slugForIssue(
+          found.value.number,
+          found.value.title,
+        );
+        if (canSeed) {
+          spawnPrompt = seedPrompt(
+            `Issue #${found.value.number}`,
+            found.value.title,
+            found.value.url,
+            prompt,
+          );
+        }
+      }
+    }
+
     // Build agent command
     const preferences = await getPreferences();
     const cmd = spawnBinaryFor(agent, preferences.command);
@@ -4014,12 +4618,14 @@ export class DaemonServer {
           // Everything here runs before the first side effect, so that
           // refusal is a 400 with no pane and no worktree behind it.
           logPath: forkSource.session.logPath,
+          model,
         })
       : buildAgentSpawnCommand({
           agent,
           binary: cmd,
           resume,
-          prompt,
+          prompt: spawnPrompt,
+          model,
         });
     if (!commandResult.ok) {
       return Response.json(
@@ -4104,7 +4710,17 @@ export class DaemonServer {
     let spawnCwd = cwd;
     let worktreeInfo: WorktreeCreation | undefined;
     let moveInfo: SpawnMoveReport | undefined;
-    if (worktreeRequest.value) {
+    /** A `--pr` tracking-config write that failed after the worktree existed. */
+    let prConfigProblem: string | undefined;
+    /** Non-fatal notes from a successful spawn, echoed to the caller. */
+    const warnings: string[] = [];
+    // `pr`/`issue` imply a worktree without one being asked for: the whole
+    // point of both flags is a checkout to work in. The synthesized request
+    // is empty except for the `base` an `--issue --base` rides in on, which
+    // `normalizeWorktreeRequest` has already validated.
+    const worktreeValue =
+      worktreeRequest.value ?? (sourceFlag ? {} : undefined);
+    if (worktreeValue) {
       const gitInfo = await this.getGitInfo(cwd);
       if (!gitInfo.mainRepoRoot) {
         return Response.json(
@@ -4113,7 +4729,7 @@ export class DaemonServer {
         );
       }
       const mainRepoRoot = gitInfo.mainRepoRoot;
-      const { withChanges, untracked, ...creation } = worktreeRequest.value;
+      const { withChanges, untracked, ...creation } = worktreeValue;
 
       // A FORK's destination takes both its name and its start point from the
       // source checkout's HEAD, because neither default fits one:
@@ -4169,6 +4785,64 @@ export class DaemonServer {
             },
             { status: 400, headers },
           );
+        }
+      }
+
+      // A `--pr` spawn checks out the PR's OWN head ref, so its branch is
+      // decided here rather than by the worktree's name. Two steps, in this
+      // order:
+      //
+      // 1. The branch already being checked out somewhere is opened rather
+      //    than refused: Enter on a checked-out PR goes THERE. Confirmed
+      //    again under the repo lock inside `createWorktree`.
+      // 2. The fetch and the branch decision, which `preparePRBranch` runs
+      //    under the repo lock and releases before returning — it must not
+      //    still hold it when `createWorktree` takes the same lock below.
+      let prBranch: string | undefined;
+      let prBranchExisted: boolean | undefined;
+      // `undefined` until prepare looks the base up. Occupied skips prepare,
+      // and `configurePRBranch` must not treat that as a decline (a `null`
+      // would unset the `ccmux-base` the first spawn recorded).
+      let prBase: string | null | undefined;
+      if (prSource) {
+        // Before the branch check and well before the fetch: `gh` resolved
+        // the number through its own repo selection, and the fetch below is
+        // hardcoded to `origin`. If those name different repositories,
+        // everything after this point would be about the wrong PR.
+        const mismatch = await prRepoMismatch(mainRepoRoot, prSource);
+        if (mismatch) {
+          return Response.json({ error: mismatch }, { status: 400, headers });
+        }
+        const occupied = await branchCheckedOutAt(
+          mainRepoRoot,
+          prSource.headRefName,
+        );
+        if (occupied) {
+          // Open that checkout rather than refusing. `createWorktree` will
+          // confirm under the repo lock and open it; skip the fetch — the
+          // branch is already here. Leave `prBase` unset so the later
+          // `configurePRBranch` does not wipe a still-correct `ccmux-base`.
+          prBranch = prSource.headRefName;
+          // Occupied means the branch exists; carried, not re-derived
+          // (see `branchExists` in `worktree-create.ts`).
+          prBranchExisted = true;
+        } else {
+          const prepared = await preparePRBranch(mainRepoRoot, prSource);
+          if (!prepared.ok) {
+            return Response.json(
+              { error: prepared.error },
+              { status: 400, headers },
+            );
+          }
+          prBranch = prSource.headRefName;
+          // Only this answer came through the checks that prove the branch is
+          // this PR's, and the prep released the repo lock before returning,
+          // so the create must not re-derive it (issue #157).
+          prBranchExisted = prepared.value.branchExisted;
+          // The SHA, never `FETCH_HEAD`: the base-branch fetch inside the prep
+          // has already overwritten that ref.
+          creation.base = prepared.value.head;
+          prBase = prepared.value.baseRemoteRef;
         }
       }
 
@@ -4281,10 +4955,36 @@ export class DaemonServer {
           ...(moved.flattenedIndex ? { flattenedIndex: true } : {}),
         };
       } else {
+        const issueNumber = issueResult.value;
         const created = await createWorktree(mainRepoRoot, {
           ...creation,
-          prompt: prompt ?? undefined,
-          derivedName,
+          // No prompt on the pr/issue paths, deliberately:
+          // `resolveWorktreeName` PREFERS a prompt over a derived name, so
+          // threading the seeded one through would silently rename the
+          // worktree after the PR's title and lose the `pr-<n>-` prefix that
+          // keeps it clear of Claude Code's own `pr-<n>` directories.
+          prompt: sourceFlag ? undefined : (prompt ?? undefined),
+          derivedName: sourceWorktreeName ?? derivedName,
+          // No base recorded on the PR path, deliberately: `creation.base` is
+          // the PR's own head sha, so the record would make the branch its
+          // own review base. `configurePRBranch` writes that key here with
+          // the branch the PR targets, and when it cannot, no key is what
+          // lets the picker's `D` fall back to its heuristic base.
+          ...(prBranch
+            ? {
+                branch: prBranch,
+                branchExists: prBranchExisted,
+                recordBase: false,
+              }
+            : {}),
+          // Under the lock, so a checkout that appeared while the picker
+          // sat open is still found: numbering `issue-<n>-<slug>-2` would
+          // break Enter's "already checked out → open it" guarantee.
+          ...(issueNumber !== undefined
+            ? {
+                reuseExisting: (trees) => pickIssueWorktree(issueNumber, trees),
+              }
+            : {}),
         });
         if (!created.ok) {
           return Response.json(
@@ -4294,6 +4994,29 @@ export class DaemonServer {
         }
         worktreeInfo = created.result;
         spawnCwd = created.result.path;
+        // After creation, and on the reused-branch path too: every write is
+        // idempotent, so a branch an older ccmux left half-configured heals.
+        //
+        // A failure is CARRIED rather than returned here, because by now the
+        // worktree exists: it is reported through `setupFailure` below, which
+        // is the convention for everything that goes wrong after setup landed
+        // (the worktree is deliberately not rolled back, and the response has
+        // to name what the user now owns). Declared above the block so this
+        // survives it.
+        if (prSource) {
+          const configured = await configurePRBranch(
+            mainRepoRoot,
+            created.result.branch,
+            prSource,
+            prBase,
+          );
+          if (!configured.ok) prConfigProblem = configured.error;
+          // A key that could not be written but does not decide where a push
+          // goes. Reported, never fatal; see `configurePRBranch`.
+          else if (configured.value.baseNote) {
+            warnings.push(configured.value.baseNote);
+          }
+        }
       }
     }
 
@@ -4349,12 +5072,28 @@ export class DaemonServer {
       ...(moveInfo ? { move: moveInfo } : {}),
     });
 
+    // A `--pr` whose tracking config could not be written in full. Reported
+    // here, through the same notes every post-setup failure uses, and BEFORE
+    // the pane: starting an agent in a worktree whose branch may push to the
+    // wrong repository is the one outcome this must not produce silently.
+    // The worktree stays, as it does for every other failure past this line.
+    if (prConfigProblem) {
+      return Response.json(setupFailure(prConfigProblem), {
+        status: 500,
+        headers,
+      });
+    }
+
     // Create tmux pane
+    // A new window is named after the worktree when the spawn has one (the
+    // `--worktree` name, `issue-<n>-...`, `pr-<n>-...`, a reused checkout),
+    // else after the agent; `buildTmuxSpawnArgv` ignores it for a split.
     const spawnArgv = buildTmuxSpawnArgv({
       split,
       cwd: spawnCwd,
       placement,
       detach,
+      windowName: worktreeInfo?.name ?? agent.name,
     });
     const tmuxCmd = spawnArgv[0];
     // Hoisted so the outer catch (below) can kill a pane that was created
@@ -4473,6 +5212,9 @@ export class DaemonServer {
           command,
           worktree: worktreeInfo,
           move: moveInfo,
+          // Things that went wrong without making the spawn wrong. Omitted
+          // when empty so an ordinary spawn's body is unchanged.
+          ...(warnings.length > 0 ? { warnings } : {}),
         },
         { headers },
       );

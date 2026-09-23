@@ -6,6 +6,7 @@ import { extractEncodedProjectPath, readTranscriptCwd } from "./parser";
 import { discoverAgentProcesses } from "./processes";
 import { listTmuxPanes, normalizeTty } from "./pane-discovery";
 import { findPaneForNewSession, findPaneByMarker } from "./session-pane-match";
+import { lazyProcessTree, ProcessTree } from "./process-tree";
 import { CLAUDE_AGENT_DEF } from "../lib/agents";
 import {
   getSessionTimestampsIn,
@@ -44,7 +45,8 @@ const LOG_POLL_INTERVAL_MS = 1000;
  * agent's own hook marker rather than from the store.
  *
  * Only a marker that (a) exists for this session, (b) belongs to this
- * session's agent, and (c) currently records `waiting_permission` with a
+ * session's agent, and (c) currently records a WAITING state
+ * (`waiting_permission`, or `waiting_question` per issue #137) with a
  * usable numeric `state_timestamp` (float SECONDS, from jq's `now`) yields a
  * value; every other shape is `undefined`, which sends the adapter back to
  * its `statusChangedAt` fallback.
@@ -52,7 +54,11 @@ const LOG_POLL_INTERVAL_MS = 1000;
 function markerWaitEstablishedAt(session: Session): string | undefined {
   const marker = getSessionPidMarker(session.nativeSessionId ?? session.id);
   if (!marker || marker.agent_type !== session.agentType) return undefined;
-  if (marker.state !== "waiting_permission") return undefined;
+  if (
+    marker.state !== "waiting_permission" &&
+    marker.state !== "waiting_question"
+  )
+    return undefined;
   const seconds = marker.state_timestamp;
   if (typeof seconds !== "number" || !Number.isFinite(seconds))
     return undefined;
@@ -455,9 +461,13 @@ export class LogWatcher {
   }
 
   private async processInitialHookBackedBatch(paths: string[]): Promise<void> {
-    const [claudeProcs, panes] = await Promise.all([
+    // One tree for the whole batch (this runs once, at watcher start): it is
+    // what lets a transcript whose agent sits behind a pty-allocating wrapper
+    // reach its pane at all, since the agent's tty belongs to no pane.
+    const [claudeProcs, panes, processTree] = await Promise.all([
       discoverAgentProcesses([CLAUDE_AGENT_DEF]),
       listTmuxPanes(),
+      ProcessTree.build(),
     ]);
 
     // Gather the observation: one item per discovered path (unresolvable
@@ -489,6 +499,7 @@ export class LogWatcher {
     const { actions, warnings } = decideInitialClaudeBatch(items, {
       processes: claudeProcs,
       panes,
+      processTree,
       sessions: this.buildReplaceableSlices(),
       markerPidBySessionId: getMarkerPidSnapshot(),
       getSessionTimestamps: (sessionId, projectPath) =>
@@ -518,6 +529,7 @@ export class LogWatcher {
             action.sessionId,
             action.path,
             "claude",
+            action.cwd,
           );
           this.sessionManager.setTmuxPane(action.sessionId, action.paneId);
           this.sessionManager.setPid(action.sessionId, action.pid);
@@ -533,6 +545,7 @@ export class LogWatcher {
             action.sessionId,
             action.path,
             "claude",
+            action.cwd,
           );
           this.fileOffsets.set(action.path, 0);
           await this.processFile(action.path, action.sessionId);
@@ -562,6 +575,7 @@ export class LogWatcher {
     sessionId: string,
     path: string,
     markerPid: number,
+    transcriptCwd: string | null,
   ): Promise<boolean> {
     const decision = decideReplaceHeuristic(
       this.buildReplaceableSlices(),
@@ -576,6 +590,7 @@ export class LogWatcher {
       path,
       paneId: decision.paneId,
       pid: markerPid,
+      cwd: transcriptCwd,
     });
     return true;
   }
@@ -588,6 +603,8 @@ export class LogWatcher {
     path: string;
     paneId: string;
     pid: number;
+    /** The session's real cwd; see {@link InitialBatchAction}. */
+    cwd: string | null;
   }): Promise<void> {
     this.adapter.onSessionRemoved?.(action.removeSessionId);
     this.sessionManager.removeSession(action.removeSessionId);
@@ -595,7 +612,12 @@ export class LogWatcher {
     this.encodingDriftWarned.delete(action.removeSessionId);
     this.unwatchFile(action.removeLogPath);
 
-    this.sessionManager.createSession(action.sessionId, action.path, "claude");
+    this.sessionManager.createSession(
+      action.sessionId,
+      action.path,
+      "claude",
+      action.cwd,
+    );
     this.sessionManager.setTmuxPane(action.sessionId, action.paneId);
     this.sessionManager.setPid(action.sessionId, action.pid);
     this.fileOffsets.set(action.path, 0);
@@ -685,10 +707,24 @@ export class LogWatcher {
     }
 
     const marker = getSessionPidMarker(sessionId);
-    const paneInfo = await findPaneByMarker(sessionId);
+    // Read up front rather than only on the fallback path below: the
+    // marker-claimed branch is the one that USED to create the session with a
+    // decoded project dir name, so a hyphenated cwd came out corrupted
+    // precisely when hooks were installed (issue #156). Claude's marker
+    // carries no cwd, so the transcript is the authoritative source here.
+    const transcriptCwd = readTranscriptCwd(path);
+    // One tree across both resolvers below (built only if one of them
+    // actually reaches its ancestry pass).
+    const getProcessTree = lazyProcessTree();
+    const paneInfo = await findPaneByMarker(sessionId, getProcessTree);
 
     if (paneInfo) {
-      this.sessionManager.createSession(sessionId, path, "claude");
+      this.sessionManager.createSession(
+        sessionId,
+        path,
+        "claude",
+        transcriptCwd,
+      );
       this.sessionManager.setTmuxPane(sessionId, paneInfo.paneId);
       const processPid = await this.findProcessPidForPane(paneInfo.paneId);
       this.sessionManager.setPid(sessionId, marker?.pid ?? processPid ?? null);
@@ -697,7 +733,6 @@ export class LogWatcher {
       return;
     }
 
-    const transcriptCwd = readTranscriptCwd(path);
     this.warnOnEncodingDrift(sessionId, transcriptCwd, encodedProjectPath);
 
     const decision = await findPaneForNewSession(
@@ -705,10 +740,16 @@ export class LogWatcher {
       encodedProjectPath,
       sessionId,
       transcriptCwd,
+      getProcessTree,
     );
 
     if (decision.kind === "bound") {
-      this.sessionManager.createSession(sessionId, path, "claude");
+      this.sessionManager.createSession(
+        sessionId,
+        path,
+        "claude",
+        transcriptCwd,
+      );
       this.sessionManager.setTmuxPane(sessionId, decision.pane.paneId);
       this.sessionManager.setPid(sessionId, decision.pid);
       this.fileOffsets.set(path, 0);
@@ -717,7 +758,12 @@ export class LogWatcher {
     }
 
     if (decision.kind === "ambiguous") {
-      this.sessionManager.createSession(sessionId, path, "claude");
+      this.sessionManager.createSession(
+        sessionId,
+        path,
+        "claude",
+        transcriptCwd,
+      );
       this.fileOffsets.set(path, 0);
       await this.processFile(path, sessionId);
       return;
@@ -731,6 +777,7 @@ export class LogWatcher {
         sessionId,
         path,
         marker.pid,
+        transcriptCwd,
       );
       if (replaced) return;
     }
@@ -767,7 +814,11 @@ export class LogWatcher {
     if (!encodedProjectPath) return;
 
     const marker = getSessionPidMarker(sessionId);
-    const paneInfo = await findPaneByMarker(sessionId);
+    // This pass runs every REBIND_COOLDOWN_MS for every unbound Claude
+    // session, so the two resolvers below share ONE tree rather than each
+    // spawning its own `ps`.
+    const getProcessTree = lazyProcessTree();
+    const paneInfo = await findPaneByMarker(sessionId, getProcessTree);
     if (paneInfo) {
       this.sessionManager.setTmuxPane(sessionId, paneInfo.paneId);
       const processPid = await this.findProcessPidForPane(paneInfo.paneId);
@@ -780,6 +831,7 @@ export class LogWatcher {
       encodedProjectPath,
       sessionId,
       readTranscriptCwd(path),
+      getProcessTree,
     );
     if (decision.kind === "bound") {
       this.sessionManager.setTmuxPane(sessionId, decision.pane.paneId);

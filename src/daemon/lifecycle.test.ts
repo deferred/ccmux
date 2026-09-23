@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { writeFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from "fs";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 import { tmpdir } from "os";
 import { spawn } from "child_process";
 import {
@@ -11,6 +11,9 @@ import {
   findDaemonPidByPort,
   stopDaemonByPort,
   isStandaloneBinary,
+  daemonSpawnArgv,
+  shouldRetryHealthProbe,
+  type HealthFetch,
 } from "./lifecycle";
 import { getPidFilePath } from "../lib/config";
 
@@ -288,6 +291,22 @@ describe("stopDaemonByPort", () => {
     mockBunSpawn(""); // lsof finds no listener
     expect(await stopDaemonByPort()).toBe(false);
   });
+
+  it("does not kill a listener that is not the expected confirm-time pid", async () => {
+    const listener = spawnSleepProcess();
+    mockBunSpawn(`${listener}\n`);
+    expect(await stopDaemonByPort(listener + 1)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(isProcessAlive(listener)).toBe(true);
+  });
+
+  it("kills the listener when it still matches the expected confirm-time pid", async () => {
+    const listener = spawnSleepProcess();
+    mockBunSpawn(`${listener}\n`);
+    expect(await stopDaemonByPort(listener)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(isProcessAlive(listener)).toBe(false);
+  });
 });
 
 describe("isStandaloneBinary", () => {
@@ -325,5 +344,173 @@ describe("isStandaloneBinary", () => {
   it("treats a real dev script path as not standalone", () => {
     expect(isStandaloneBinary("/Users/me/ccmux/src/index.ts")).toBe(false);
     expect(isStandaloneBinary("/home/me/ccmux/dist/index.js")).toBe(false);
+  });
+});
+
+describe("daemonSpawnArgv", () => {
+  it("resolves a relative bun script against the import-time cwd (bin/ccmux + sidebar chdir)", () => {
+    // Pre-fix spawn forwarded argv[1] as-is. After the sidebar chdirs to
+    // CCMUX_CALLER_PWD, bun looks for dist/index.js in the caller's directory
+    // and cannot start the replacement daemon.
+    expect(
+      daemonSpawnArgv("dist/index.js", "/usr/local/bin/bun", "/opt/ccmux"),
+    ).toEqual(["/opt/ccmux/dist/index.js", "daemon", "start"]);
+    expect(
+      daemonSpawnArgv("src/index.ts", "/root/.bun/bin/bun", "/home/me/ccmux"),
+    ).toEqual(["/home/me/ccmux/src/index.ts", "daemon", "start"]);
+  });
+
+  it("keeps an already-absolute script path", () => {
+    expect(
+      daemonSpawnArgv("/opt/ccmux/src/index.ts", "/usr/bin/bun", "/elsewhere"),
+    ).toEqual(["/opt/ccmux/src/index.ts", "daemon", "start"]);
+  });
+
+  it("omits the script path for a compiled binary", () => {
+    expect(
+      daemonSpawnArgv("/$bunfs/root/index.js", "/usr/local/bin/ccmux", "/tmp"),
+    ).toEqual(["daemon", "start"]);
+  });
+
+  it("bun finds the resolved script after cwd has left the package root", async () => {
+    const root = join(
+      tmpdir(),
+      `ccmux-daemon-spawn-${process.pid}-${Date.now()}`,
+    );
+    const caller = join(
+      tmpdir(),
+      `ccmux-caller-pwd-${process.pid}-${Date.now()}`,
+    );
+    mkdirSync(join(root, "dist"), { recursive: true });
+    mkdirSync(caller, { recursive: true });
+    writeFileSync(
+      join(root, "dist", "index.js"),
+      'process.stdout.write("ok\\n");',
+    );
+    try {
+      const args = daemonSpawnArgv("dist/index.js", process.execPath, root);
+      expect(args[0]).toBe(resolve(root, "dist/index.js"));
+
+      // Sidebar has already chdir'd; spawn inherits that cwd. A relative
+      // argv[1] (the pre-fix spawn) makes bun miss the script.
+      const proc = Bun.spawn([process.execPath, args[0]], {
+        cwd: caller,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exit] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      expect(exit).toBe(0);
+      expect(stdout).toBe("ok\n");
+      expect(stderr).toBe("");
+
+      const relative = Bun.spawn([process.execPath, "dist/index.js"], {
+        cwd: caller,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(await relative.exited).not.toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(caller, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("shouldRetryHealthProbe", () => {
+  it("retries a timeout (a listener accepted but answered late)", () => {
+    expect(
+      shouldRetryHealthProbe(
+        new DOMException("The operation timed out.", "TimeoutError"),
+      ),
+    ).toBe(true);
+    expect(
+      shouldRetryHealthProbe(new DOMException("aborted", "AbortError")),
+    ).toBe(true);
+  });
+
+  it("does NOT retry a refused connection, so the cold path stays fast", async () => {
+    // The real runtime shape, not a hand-built one: bind a port, close it,
+    // then probe it. Bun rejects with a plain Error, code ConnectionRefused.
+    const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+    const url = `http://127.0.0.1:${server.port}/health`;
+    server.stop(true);
+    let refused: unknown;
+    try {
+      await fetch(url, { signal: AbortSignal.timeout(1000) });
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeDefined();
+    expect((refused as { name?: string }).name).not.toBe("TimeoutError");
+    expect(shouldRetryHealthProbe(refused)).toBe(false);
+  });
+
+  it("does NOT retry an unknown error shape", () => {
+    expect(shouldRetryHealthProbe(new Error("boom"))).toBe(false);
+    expect(shouldRetryHealthProbe(new TypeError("fetch failed"))).toBe(false);
+    expect(shouldRetryHealthProbe(undefined)).toBe(false);
+    expect(shouldRetryHealthProbe(null)).toBe(false);
+    expect(shouldRetryHealthProbe("timed out")).toBe(false);
+  });
+});
+
+describe("isDaemonRunningAsync health retry", () => {
+  beforeEach(setupTempHome);
+  afterEach(teardown);
+
+  const timeout = () =>
+    new DOMException("The operation timed out.", "TimeoutError");
+
+  /** Records the budget of every probe and answers from a queue. */
+  function probes(answers: Array<"ok" | "timeout" | "refused">) {
+    const budgets: number[] = [];
+    const fetchHealth: HealthFetch = async (_url, timeoutMs) => {
+      budgets.push(timeoutMs);
+      const answer = answers.shift();
+      if (answer === "ok") return new Response("{}", { status: 200 });
+      if (answer === "timeout") throw timeout();
+      const error = new Error("Unable to connect.");
+      Object.assign(error, { code: "ConnectionRefused" });
+      throw error;
+    };
+    return { fetchHealth, budgets };
+  }
+
+  it("a daemon still booting: first probe times out, the retry answers", async () => {
+    const { fetchHealth, budgets } = probes(["timeout", "ok"]);
+    expect(await isDaemonRunningAsync(fetchHealth)).toBe(true);
+    expect(budgets).toEqual([100, 1000]);
+  });
+
+  it("two timeouts is not running", async () => {
+    const { fetchHealth, budgets } = probes(["timeout", "timeout"]);
+    expect(await isDaemonRunningAsync(fetchHealth)).toBe(false);
+    expect(budgets).toEqual([100, 1000]);
+  });
+
+  it("a refused connection probes exactly once", async () => {
+    const { fetchHealth, budgets } = probes(["refused"]);
+    expect(await isDaemonRunningAsync(fetchHealth)).toBe(false);
+    expect(budgets).toEqual([100]);
+  });
+
+  it("a healthy daemon probes exactly once", async () => {
+    const { fetchHealth, budgets } = probes(["ok"]);
+    expect(await isDaemonRunningAsync(fetchHealth)).toBe(true);
+    expect(budgets).toEqual([100]);
+  });
+
+  it("a non-ok response is not retried", async () => {
+    const budgets: number[] = [];
+    const fetchHealth: HealthFetch = async (_url, timeoutMs) => {
+      budgets.push(timeoutMs);
+      return new Response("nope", { status: 500 });
+    };
+    expect(await isDaemonRunningAsync(fetchHealth)).toBe(false);
+    expect(budgets).toEqual([100]);
   });
 });

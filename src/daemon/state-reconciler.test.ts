@@ -1,4 +1,12 @@
-import { afterAll, describe, expect, it, mock, beforeEach } from "bun:test";
+import {
+  afterAll,
+  describe,
+  expect,
+  it,
+  mock,
+  beforeEach,
+  spyOn,
+} from "bun:test";
 import { join } from "path";
 import { tmpdir } from "os";
 import { BUILTIN_AGENTS, type AgentDef } from "../lib/agents";
@@ -727,6 +735,181 @@ describe("reconcileAll", () => {
 
       const session = sessionManager.getSession(id)!;
       expect(session.status).toBe("working");
+    });
+
+    // Issue #177: a row can hold a session id the OTHER server hosts until
+    // the link pass heals it, so the fold checks the marker's pid resolves
+    // to the row's own pane before painting that server's aggregate.
+    describe("marker pane ownership", () => {
+      function hostedMarker(pid: number): SessionPidMarker {
+        return ocMarker({
+          session_id: "ses_primary",
+          pid,
+          state: "working",
+          state_timestamp: 1_000,
+          last_prompt: "the other pane's prompt",
+        });
+      }
+
+      async function reconcileWithHosting(
+        marker: SessionPidMarker,
+        overrides: Partial<ReconcilerDeps> = {},
+      ): Promise<void> {
+        await reconcileAll(
+          makeDeps(sessionManager, {
+            hookManager: {
+              getMarkerForSession: () => marker,
+              getMarkersByAgentAndPid: () => [marker],
+            },
+            agents: [opencodeAgent],
+            ...overrides,
+          }),
+          makeSnapshot({
+            panes: [fakePane({ paneId: "%2", tty: "ttys002" })],
+          }),
+        );
+      }
+
+      it("ignores a marker whose pid is hosted by a different pane, warning once", async () => {
+        const id = opencodeSession();
+        const marker = hostedMarker(5_555);
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await reconcileWithHosting(marker, {
+            paneIdHostingPid: () => "%9",
+          });
+          await reconcileWithHosting(marker, {
+            paneIdHostingPid: () => "%9",
+          });
+
+          const foreignWarnings = warn.mock.calls.filter((call) =>
+            String(call[0]).includes("holds marker"),
+          );
+          expect(foreignWarnings).toHaveLength(1);
+        } finally {
+          warn.mockRestore();
+        }
+
+        const session = sessionManager.getSession(id)!;
+        expect(session.status).toBe("idle");
+        expect(session.lastPrompt).toBeNull();
+      });
+
+      it("lets the terminal source speak once the foreign marker is dropped", async () => {
+        // Dropping the marker means "proceed as if there were none", not
+        // "produce no state": the pane's own rules stay the baseline.
+        const id = opencodeSession();
+        mockCapturePane = async () => "processing your request";
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await reconcileWithHosting(hostedMarker(5_560), {
+            paneIdHostingPid: () => "%9",
+            agents: [
+              {
+                ...opencodeAgent,
+                terminalRules: [
+                  {
+                    status: "working",
+                    attentionType: null,
+                    pendingTool: null,
+                    matchAny: ["processing"],
+                  },
+                ],
+              },
+            ],
+          });
+        } finally {
+          warn.mockRestore();
+        }
+
+        const session = sessionManager.getSession(id)!;
+        expect(session.status).toBe("working");
+        expect(session.lastPrompt).toBeNull();
+      });
+
+      it("applies a marker whose pid is hosted by the row's own pane", async () => {
+        const id = opencodeSession();
+        await reconcileWithHosting(hostedMarker(5_556), {
+          paneIdHostingPid: () => "%2",
+        });
+
+        const session = sessionManager.getSession(id)!;
+        expect(session.status).toBe("working");
+        expect(session.lastPrompt).toBe("the other pane's prompt");
+      });
+
+      it("applies the marker when the pid is under no known pane (fail open)", async () => {
+        // A pid that spawned after the last process snapshot resolves to
+        // null; dropping its marker would blind the row for a full scan.
+        const id = opencodeSession();
+        await reconcileWithHosting(hostedMarker(5_557), {
+          paneIdHostingPid: () => null,
+        });
+
+        expect(sessionManager.getSession(id)!.status).toBe("working");
+      });
+
+      it("applies the marker during the boot window (fail open)", async () => {
+        const id = opencodeSession();
+        await reconcileWithHosting(hostedMarker(5_558), {
+          paneIdHostingPid: () => undefined,
+        });
+
+        expect(sessionManager.getSession(id)!.status).toBe("working");
+      });
+
+      it("applies the marker when deps carry no pane resolver at all", async () => {
+        const id = opencodeSession();
+        await reconcileWithHosting(hostedMarker(5_559));
+
+        expect(sessionManager.getSession(id)!.status).toBe("working");
+      });
+
+      it("leaves a non-opencode agent's foreign-pane marker alone", async () => {
+        // The guard is opencode-only: every other agent is one session per
+        // pane, so its marker pid carries no cross-pane ambiguity.
+        const id = makeSession(sessionManager, {
+          agentType: "cursor",
+          trackingMode: "pane",
+          status: "idle",
+          tmuxPane: "%2",
+          nativeSessionId: "cur-1",
+        });
+        const cursorAgent: AgentDef = {
+          name: "cursor",
+          shortCode: "CU",
+          processMatch: /cursor/,
+          terminalRules: [],
+          hooks: { type: "generic-status" },
+        };
+        const marker: SessionPidMarker = {
+          agent_type: "cursor",
+          pid: 7_777,
+          session_id: "cur-1",
+          timestamp: 1,
+          state: "working",
+          state_timestamp: 1_000,
+          last_prompt: "cursor prompt",
+        };
+
+        await reconcileAll(
+          makeDeps(sessionManager, {
+            hookManager: {
+              getMarkerForSession: () => marker,
+              getMarkersByAgentAndPid: () => [],
+            },
+            agents: [cursorAgent],
+            paneIdHostingPid: () => "%9",
+          }),
+          makeSnapshot({
+            panes: [fakePane({ paneId: "%2", tty: "ttys002" })],
+          }),
+        );
+
+        const session = sessionManager.getSession(id)!;
+        expect(session.status).toBe("working");
+        expect(session.lastPrompt).toBe("cursor prompt");
+      });
     });
   });
 
@@ -2186,7 +2369,36 @@ describe("reconcileAll", () => {
       expect(session.status).toBe("idle");
     });
 
-    it("pane-tracked Claude: active state has no explicit handling (no update)", async () => {
+    it("native: keeps working when the pane still shows a working spinner", async () => {
+      mockDetectPaneState = async () => ({
+        state: "working",
+        attentionType: null,
+        pendingTool: null,
+      });
+
+      const id = makeSession(sessionManager, {
+        status: "working",
+        trackingMode: "native",
+        pid: 12345,
+        tmuxPane: "%1",
+        lastActivityAt: TWO_MINUTES_AGO,
+      });
+
+      await reconcileAll(
+        makeDeps(sessionManager),
+        makeSnapshot({
+          processes: [fakeProcess()],
+          panes: [fakePane()],
+        }),
+      );
+
+      const session = sessionManager.getSession(id)!;
+      expect(session.status).toBe("working");
+    });
+
+    // In `claude-no-hooks` mode the watcher never touches these sessions, so
+    // this arm's `active` branch is their only way back to idle.
+    it("pane-tracked Claude: downgrades working to idle on active", async () => {
       mockDetectPaneState = async () => ({
         state: "active",
         attentionType: null,
@@ -2207,8 +2419,82 @@ describe("reconcileAll", () => {
       );
 
       const session = sessionManager.getSession(id)!;
-      // Pane-tracked Claude has no "active" case, so status stays as-is
-      expect(session.status).toBe("working");
+      expect(session.status).toBe("idle");
+      expect(session.attentionType).toBeNull();
+      expect(session.pendingTool).toBeNull();
+    });
+
+    // The answered permission: pre-#205 a static ✳ title plus active content
+    // mapped to `idle` and cleared this unconditionally.
+    it("pane-tracked Claude: clears a waiting row on active", async () => {
+      mockDetectPaneState = async () => ({
+        state: "active",
+        attentionType: null,
+        pendingTool: null,
+      });
+
+      const id = makeSession(sessionManager, {
+        agentType: "claude",
+        trackingMode: "pane",
+        status: "waiting",
+        attentionType: "permission",
+        pendingTool: "Bash",
+        tmuxPane: "%1",
+        lastActivityAt: TWO_MINUTES_AGO,
+      });
+
+      await reconcileAll(
+        makeDeps(sessionManager),
+        makeSnapshot({ panes: [fakePane()] }),
+      );
+
+      const session = sessionManager.getSession(id)!;
+      expect(session.status).toBe("idle");
+      expect(session.attentionType).toBeNull();
+      expect(session.pendingTool).toBeNull();
+    });
+
+    // The arm re-detects every tick past the 30s guard, so the branch must be
+    // gated on the current status: an unconditional write would churn
+    // `lastActivityAt` and reorder the picker on every scan.
+    it("pane-tracked Claude: writes nothing when an idle row stays active", async () => {
+      let paneInspected = false;
+      mockDetectPaneState = async () => {
+        paneInspected = true;
+        return { state: "active", attentionType: null, pendingTool: null };
+      };
+
+      const id = makeSession(sessionManager, {
+        agentType: "claude",
+        trackingMode: "pane",
+        status: "idle",
+        tmuxPane: "%1",
+        lastActivityAt: TWO_MINUTES_AGO,
+      });
+
+      // Installed AFTER makeSession, whose own setup calls updateSession.
+      const updateSpy = spyOn(sessionManager, "updateSession");
+      let calls: unknown[][] = [];
+      try {
+        await reconcileAll(
+          makeDeps(sessionManager),
+          makeSnapshot({ panes: [fakePane()] }),
+        );
+        // Snapshot BEFORE restoring: mockRestore also clears `mock.calls`.
+        calls = updateSpy.mock.calls.map((call) => [...call]);
+      } finally {
+        updateSpy.mockRestore();
+      }
+
+      // Detection ran (otherwise this asserts nothing) and wrote no status.
+      expect(paneInspected).toBe(true);
+      const statusWrites = calls.filter(
+        (call) => (call[1] as Partial<Session>).status !== undefined,
+      );
+      expect(statusWrites).toEqual([]);
+      const session = sessionManager.getSession(id)!;
+      expect(session.status).toBe("idle");
+      expect(session.lastActivityAt).toBe(TWO_MINUTES_AGO);
     });
   });
 
@@ -3626,10 +3912,12 @@ describe("native cascade (Claude + Codex)", () => {
 
     expect(nativeArmGetMarker).toBe(0);
     expect(paneArmGetMarker).toBeGreaterThan(0);
-    // No marker → cascade does not run → existing pane-detection
-    // fall-through preserves the session's prior state.
+    // No marker → cascade does not run → pane detection decides. The default
+    // mock reports `active`, which now downgrades this stale `working` row to
+    // idle (the arm's only idle source in `claude-no-hooks` mode); before that
+    // branch existed, `active` fell through and left the row at `working`.
     const session = sessionManager.getSession(id)!;
-    expect(session.status).toBe("working");
+    expect(session.status).toBe("idle");
   });
 
   it("pane-tracked Claude with fresh waiting_permission marker keeps log-derived pendingTool", async () => {

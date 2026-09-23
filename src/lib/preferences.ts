@@ -60,6 +60,12 @@ export interface AgentConfig {
    * you have checked that resuming a LIVE session does not disturb it.
    */
   forkCommand?: string;
+  /**
+   * The agent's model flag (`"--model"`), spliced after the launcher binary
+   * by `ccmux spawn --model`. See `AgentDef.modelFlag`. Without it, a model
+   * spawn is refused for this agent.
+   */
+  modelFlag?: string;
   sessionFilePattern?: string;
   executable?: string;
   invokeMode?: InvokeModeConfig;
@@ -159,6 +165,7 @@ export const COLUMN_FIELDS = [
   "cwd",
   "branch",
   "pr",
+  "summary",
 ] as const;
 export type ColumnField = (typeof COLUMN_FIELDS)[number];
 
@@ -191,7 +198,12 @@ interface SidebarConfig {
   width?: number; // default DEFAULT_SIDEBAR_WIDTH
   position?: "left" | "right"; // default "left"
   columns?: ColumnsConfig;
+  /** Sidebar override for {@link Preferences.promptLines}. */
+  promptLines?: number;
 }
+
+/** Upper bound for `promptLines`: past this a single row crowds out the list. */
+export const MAX_PROMPT_LINES = 10;
 
 export const DEFAULT_SIDEBAR_WIDTH = 30;
 
@@ -320,6 +332,15 @@ export interface Preferences {
   /** Default prompt display mode (default "inline"). The runtime `p`-key
    *  toggle (persisted in UIState) overrides this. */
   promptDisplay?: PromptDisplay;
+  /**
+   * Render the last prompt as a wrapped block of up to this many lines,
+   * below the row's other lines (default 0, off).
+   *
+   * The `prompt` COLUMN is one truncated line; this is the same text given
+   * room to be read. They are the same content, so turning this on removes
+   * `prompt` from the rows rather than showing it twice.
+   */
+  promptLines?: number;
   /** Search pane content in TUI search (default true) */
   searchPaneContent?: boolean;
   /** Lines of pane content to scan in TUI search (default 100) */

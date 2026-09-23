@@ -11,12 +11,19 @@ import { testRender } from "@opentui/solid";
 import { MouseButtons } from "@opentui/core/testing";
 import type { SSECallbacks } from "./utils/sse";
 import * as clipboard from "./utils/clipboard";
-import { mockEnrichedSession, squish } from "./components/test-helpers";
+import {
+  deliverEscape,
+  mockEnrichedSession,
+  squish,
+} from "./components/test-helpers";
+import { liveEffects } from "./components/WorktreesPanel";
 import { HANDOFF_BADGE } from "./components/session-columns";
 import { MAX_TURNS, renderTurns } from "../daemon/transcript-read";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { SwitchToPaneResult } from "./utils/client-switch";
+import type { OpenAgentsResult } from "./utils/tmux";
 
 // Capture SSE callbacks so tests can fire events
 let sseCallbacks: SSECallbacks | null = null;
@@ -37,7 +44,9 @@ mock.module("./utils/sse", () => ({
   },
 }));
 
-const switchToPaneSpy = mock(async (_target: string): Promise<boolean> => true);
+const switchToPaneSpy = mock(
+  async (_target: string): Promise<SwitchToPaneResult> => true,
+);
 const sendKeysSpy = mock(
   async (
     _target: string,
@@ -46,15 +55,20 @@ const sendKeysSpy = mock(
 );
 const flashPaneSpy = mock(() => {});
 const flashPaneDetachedSpy = mock(() => {});
+// Assertable because a refused switch must not mark the pane active
+// daemon-wide: the real one is a fetch to the daemon.
+const notifyActivePaneSpy = mock(async () => {});
 const isPaneInCurrentWindowSpy = mock(async () => true);
 const openAgentAttachWindowSpy = mock(
-  async (): Promise<{ ok: true } | { ok: false; error: string }> => ({
+  async (): Promise<OpenAgentsResult> => ({
     ok: true,
+    clientSwitched: true,
   }),
 );
 const openAgentsWindowSpy = mock(
-  async (): Promise<{ ok: true } | { ok: false; error: string }> => ({
+  async (): Promise<OpenAgentsResult> => ({
     ok: true,
+    clientSwitched: true,
   }),
 );
 // The real one spawns `tmux list-panes` against whatever ambient TMUX the
@@ -75,7 +89,7 @@ mock.module("./utils/tmux", () => ({
   flashPaneDetached: flashPaneDetachedSpy,
   isPaneInCurrentWindow: isPaneInCurrentWindowSpy,
   selectPane: async () => true,
-  notifyActivePane: () => {},
+  notifyActivePane: notifyActivePaneSpy,
   openAgentAttachWindow: openAgentAttachWindowSpy,
   openAgentsWindow: openAgentsWindowSpy,
   resolveLaunchPane: resolveLaunchPaneSpy,
@@ -91,7 +105,8 @@ const runHunkReviewSpy = mock(
   async (
     ..._args: unknown[]
   ): Promise<
-    { ok: true; notes: typeof reviewNotes } | { ok: false; error: string }
+    | { ok: true; notes: typeof reviewNotes }
+    | { ok: false; error: string; empty?: true }
   > => ({ ok: true, notes: [] }),
 );
 const HUNK_INSTALL_HINT_TEST = realReview.HUNK_INSTALL_HINT;
@@ -194,17 +209,24 @@ let setup: Setup;
 beforeEach(() => {
   sseCallbacks = null;
   switchToPaneSpy.mockClear();
-  switchToPaneSpy.mockImplementation(async () => true);
+  switchToPaneSpy.mockImplementation(async (_target: string) => true);
   sendKeysSpy.mockClear();
   sendKeysSpy.mockImplementation(async () => true);
   flashPaneSpy.mockClear();
   flashPaneDetachedSpy.mockClear();
+  notifyActivePaneSpy.mockClear();
   isPaneInCurrentWindowSpy.mockClear();
   isPaneInCurrentWindowSpy.mockImplementation(async () => true);
   openAgentAttachWindowSpy.mockClear();
-  openAgentAttachWindowSpy.mockImplementation(async () => ({ ok: true }));
+  openAgentAttachWindowSpy.mockImplementation(async () => ({
+    ok: true,
+    clientSwitched: true,
+  }));
   openAgentsWindowSpy.mockClear();
-  openAgentsWindowSpy.mockImplementation(async () => ({ ok: true }));
+  openAgentsWindowSpy.mockImplementation(async () => ({
+    ok: true,
+    clientSwitched: true,
+  }));
   resolveLaunchPaneSpy.mockClear();
   resolveLaunchPaneSpy.mockImplementation(async () => "%7");
   uiStateWrites.length = 0;
@@ -755,7 +777,7 @@ describe("App sidebar mode", () => {
 
       setup.mockInput.pressKey("j");
       await setup.renderOnce();
-      setup.mockInput.pressKey("return");
+      setup.mockInput.pressEnter();
       await setup.renderOnce();
 
       expect(exitSpy).not.toHaveBeenCalled();
@@ -771,7 +793,7 @@ describe("App sidebar mode", () => {
 
     try {
       await renderApp(30, 20, { sidebar: true });
-      setup.mockInput.pressKey("escape");
+      deliverEscape(setup.renderer);
       await setup.renderOnce();
 
       expect(exitSpy).not.toHaveBeenCalled();
@@ -888,8 +910,73 @@ describe("App sidebar mode", () => {
     }
   });
 
+  it("background launch with no client to switch stays open and says so", async () => {
+    // The window is up but nobody was moved to it: exiting here would close
+    // the picker over a jump that never happened.
+    const exitSpy = mock(() => {});
+    const originalExit = process.exit;
+    process.exit = exitSpy as never;
+    openAgentAttachWindowSpy.mockImplementation(async () => ({
+      ok: true,
+      clientSwitched: false,
+      reason: "no-client-tty",
+    }));
+
+    try {
+      await renderApp(80, 20, { sidebar: true });
+      sseCallbacks!.onInit([backgroundSession()], null);
+      await setup.renderOnce();
+
+      setup.mockInput.pressKey("j");
+      await setup.renderOnce();
+      setup.mockInput.pressEnter();
+      await flushLaunch();
+      await setup.renderOnce();
+
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish("window opened, but no tmux client to switch"),
+      );
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.exit = originalExit;
+    }
+  });
+
+  it("background launch whose switch was refused blames the switch, not the binding", async () => {
+    // Same "window is up, nobody moved" shape as above, different cause: a
+    // captured tty that tmux refused. Pointing at the README binding here
+    // would blame a binding that is fine.
+    const exitSpy = mock(() => {});
+    const originalExit = process.exit;
+    process.exit = exitSpy as never;
+    openAgentAttachWindowSpy.mockImplementation(async () => ({
+      ok: true,
+      clientSwitched: false,
+      reason: "switch-failed",
+    }));
+
+    try {
+      await renderApp(80, 20, { sidebar: true });
+      sseCallbacks!.onInit([backgroundSession()], null);
+      await setup.renderOnce();
+
+      setup.mockInput.pressKey("j");
+      await setup.renderOnce();
+      setup.mockInput.pressEnter();
+      await flushLaunch();
+      await setup.renderOnce();
+
+      const frame = squish(setup.captureCharFrame());
+      expect(frame).toContain(squish("could not be switched"));
+      expect(frame).not.toContain(squish("no tmux client to switch"));
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      process.exit = originalExit;
+    }
+  });
+
   it("ignores a second background activation while a launch is in flight", async () => {
-    let resolveLaunch: (r: { ok: true }) => void = () => {};
+    let resolveLaunch: (r: OpenAgentsResult) => void = () => {};
     openAgentAttachWindowSpy.mockImplementation(
       () =>
         new Promise((resolve) => {
@@ -912,7 +999,7 @@ describe("App sidebar mode", () => {
       await setup.renderOnce();
 
       expect(openAgentAttachWindowSpy).toHaveBeenCalledTimes(1);
-      resolveLaunch({ ok: true });
+      resolveLaunch({ ok: true, clientSwitched: true });
       await flushLaunch();
     } finally {
       process.exit = originalExit;
@@ -1585,13 +1672,15 @@ describe("App pane-switch feedback and server scoping", () => {
   }
 
   it("one-shot picker: a failed pane switch shows a toast and does not exit", async () => {
-    switchToPaneSpy.mockImplementation(async () => false);
+    switchToPaneSpy.mockImplementation(async () => "switch-failed");
     const restoreFetch = withServerInfo(null); // fail-open: same-server guard passes
     const { exitSpy, restore: restoreExit } = withExitSpy();
     try {
       await renderWithSession();
       await selectFirstRowAndEnter();
-      expect(setup.captureCharFrame()).toContain("Failed to switch");
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish("Failed to switch: pane or client unavailable"),
+      );
       expect(exitSpy).not.toHaveBeenCalled();
     } finally {
       restoreExit();
@@ -1599,14 +1688,109 @@ describe("App pane-switch feedback and server scoping", () => {
     }
   });
 
-  it("one-shot picker: a successful pane switch exits the process", async () => {
-    // switchToPaneSpy defaults to true (beforeEach).
+  it("one-shot picker: no tmux client at all is refused without blaming a binding", async () => {
+    // The sidebar and a plain pane reach this too, and neither was launched by
+    // a binding there is anything to fix.
+    switchToPaneSpy.mockImplementation(async () => "no-client");
     const restoreFetch = withServerInfo(null);
     const { exitSpy, restore: restoreExit } = withExitSpy();
     try {
       await renderWithSession();
       await selectFirstRowAndEnter();
+      const frame = squish(setup.captureCharFrame());
+      expect(frame).toContain(squish("Cannot switch: no tmux client found"));
+      expect(frame).not.toContain(squish("binding"));
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreExit();
+      restoreFetch();
+    }
+  });
+
+  it("one-shot picker: a malformed capture names the capture, not the absence of one", async () => {
+    switchToPaneSpy.mockImplementation(async () => "malformed-capture");
+    const restoreFetch = withServerInfo(null);
+    const { exitSpy, restore: restoreExit } = withExitSpy();
+    try {
+      await renderWithSession();
+      await selectFirstRowAndEnter();
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish(
+          "Cannot switch: the captured client tty is malformed, check the tmux binding in the README",
+        ),
+      );
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreExit();
+      restoreFetch();
+    }
+  });
+
+  it("one-shot picker: a successful pane switch flashes, notifies and exits", async () => {
+    // switchToPaneSpy defaults to true (beforeEach). The visual and daemon-side
+    // feedback belongs to the success path only.
+    const restoreFetch = withServerInfo(null);
+    const { exitSpy, restore: restoreExit } = withExitSpy();
+    try {
+      await renderWithSession();
+      await selectFirstRowAndEnter();
+      expect(switchToPaneSpy).toHaveBeenCalledWith("%5");
+      expect(notifyActivePaneSpy).toHaveBeenCalledWith("%5");
+      expect(flashPaneDetachedSpy).toHaveBeenCalledWith("%5");
       expect(exitSpy).toHaveBeenCalledWith(0);
+    } finally {
+      restoreExit();
+      restoreFetch();
+    }
+  });
+
+  it("one-shot picker: a shared-session popup refusal points at the binding and leaves no trace", async () => {
+    // The only place a user hears that a session with two terminals on it
+    // needs a binding that names the client, so it has to name the fix. And
+    // nothing may have happened before the refusal: flashing the pane and
+    // marking it active daemon-wide, then saying nobody moved, is the worst of
+    // both.
+    switchToPaneSpy.mockImplementation(async () => "shared-session-popup");
+    const restoreFetch = withServerInfo(null);
+    const { exitSpy, restore: restoreExit } = withExitSpy();
+    try {
+      await renderWithSession();
+      await selectFirstRowAndEnter();
+      expect(switchToPaneSpy).toHaveBeenCalledWith("%5");
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish(
+          "Cannot switch: several terminals are attached to this tmux session, so ccmux cannot tell which one opened the popup. Pass --client-tty in the tmux binding (see README)",
+        ),
+      );
+      expect(notifyActivePaneSpy).not.toHaveBeenCalled();
+      expect(flashPaneSpy).not.toHaveBeenCalled();
+      expect(flashPaneDetachedSpy).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      restoreExit();
+      restoreFetch();
+    }
+  });
+
+  it("one-shot picker: an unknown popup client refuses without a trace", async () => {
+    // The launcher exists and could not be named. Silently switching whatever
+    // tmux calls current is exactly the wrong-terminal move the popup path
+    // exists to avoid, so the toast sends the user to the binding instead.
+    switchToPaneSpy.mockImplementation(async () => "popup-client-unknown");
+    const restoreFetch = withServerInfo(null);
+    const { exitSpy, restore: restoreExit } = withExitSpy();
+    try {
+      await renderWithSession();
+      await selectFirstRowAndEnter();
+      expect(switchToPaneSpy).toHaveBeenCalledWith("%5");
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish(
+          "Cannot switch: could not work out which terminal opened this popup. Pass --client-tty in the tmux binding (see README)",
+        ),
+      );
+      expect(notifyActivePaneSpy).not.toHaveBeenCalled();
+      expect(flashPaneDetachedSpy).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
     } finally {
       restoreExit();
       restoreFetch();
@@ -1676,13 +1860,15 @@ describe("App pane-switch feedback and server scoping", () => {
   it("persistent picker: a failed pane switch shows a toast (was sidebar-only)", async () => {
     // The Toast render gate used to be sidebar-only, so a switch failure in the
     // persistent picker showed nothing. Now it must surface here too.
-    switchToPaneSpy.mockImplementation(async () => false);
+    switchToPaneSpy.mockImplementation(async () => "switch-failed");
     const restoreFetch = withServerInfo(null);
     const { exitSpy, restore: restoreExit } = withExitSpy();
     try {
       await renderWithSession({ persistent: true });
       await selectFirstRowAndEnter();
-      expect(setup.captureCharFrame()).toContain("Failed to switch");
+      expect(squish(setup.captureCharFrame())).toContain(
+        squish("Failed to switch: pane or client unavailable"),
+      );
       expect(exitSpy).not.toHaveBeenCalled(); // persistent never exits
     } finally {
       restoreExit();
@@ -1865,6 +2051,101 @@ describe("App review (d)", () => {
     expect(runHunkReviewSpy.mock.calls[0]?.[1]).toBe("/code/myapp");
   });
 
+  // The two keys are a FIXED pair, not a default and an override: `d` is
+  // always what is uncommitted and `D` always what the checkout changed
+  // since it forked, on every row. A worktree row is here to prove it is
+  // not consulted, not because it is treated differently.
+  const WORKTREE_SESSION = {
+    isWorktree: true,
+    worktreeRoot: "/code/myapp/wt/feature",
+    paneCwd: "/code/myapp/wt/feature/src",
+  };
+
+  /** Lets the merge-base promise chain settle before the review starts. */
+  const settleReview = async () => {
+    await new Promise((r) => setTimeout(r, 0));
+    await setup.renderOnce();
+  };
+
+  it("d reviews the working tree, with no target, on a main checkout", async () => {
+    await renderWithSession();
+    setup.mockInput.pressKey("d");
+    await settleReview();
+    expect(resolveMergeBaseSpy).not.toHaveBeenCalled();
+    expect(runHunkReviewSpy.mock.calls[0]?.[2]).toEqual({ target: undefined });
+  });
+
+  // The row a context-sensitive `d` would have branch-reviewed. It gets the
+  // working tree like every other row, which is what makes the key mean one
+  // thing the user can press without reading the row first.
+  it("d reviews the working tree on a worktree session too", async () => {
+    await renderWithSession({}, WORKTREE_SESSION);
+    setup.mockInput.pressKey("d");
+    await settleReview();
+    expect(resolveMergeBaseSpy).not.toHaveBeenCalled();
+    expect(runHunkReviewSpy.mock.calls[0]?.[2]).toEqual({ target: undefined });
+  });
+
+  // Terminals disagree about how they deliver the capital: as name "D", or
+  // as name "d" with `shift` set. Testing only one spelling left the branch
+  // review unreachable on half of them, which is what the Worktrees panel's
+  // own Shift+D binding was bitten by.
+  const capitalD: [string, () => void][] = [
+    ['as "D"', () => setup.mockInput.pressKey("D")],
+    ['as shift+"d"', () => setup.mockInput.pressKey("d", { shift: true })],
+  ];
+
+  for (const [spelling, press] of capitalD) {
+    it(`D reviews a worktree session's branch (${spelling})`, async () => {
+      await renderWithSession({}, WORKTREE_SESSION);
+      press();
+      await settleReview();
+      // The CHECKOUT root, not the pane's cwd: a pane that cd'd into a
+      // subdirectory is still on the branch.
+      expect(resolveMergeBaseSpy.mock.calls[0]?.[0]).toBe(
+        "/code/myapp/wt/feature",
+      );
+      expect(runHunkReviewSpy.mock.calls[0]?.[1]).toBe(
+        "/code/myapp/wt/feature/src",
+      );
+      expect(runHunkReviewSpy.mock.calls[0]?.[2]).toEqual({
+        target: "base-sha",
+      });
+    });
+
+    it(`D reviews a main checkout's branch (${spelling})`, async () => {
+      // The production shape: the daemon fills `worktreeRoot` for a main
+      // checkout too (`--show-toplevel`), so this pins the same
+      // checkout-root-not-pane-cwd rule the worktree case does, instead of
+      // exercising the `?? cwd` fallback.
+      await renderWithSession(
+        {},
+        { worktreeRoot: "/code/myapp", paneCwd: "/code/myapp/src" },
+      );
+      press();
+      await settleReview();
+      expect(resolveMergeBaseSpy.mock.calls[0]?.[0]).toBe("/code/myapp");
+      expect(runHunkReviewSpy.mock.calls[0]?.[1]).toBe("/code/myapp/src");
+      expect(runHunkReviewSpy.mock.calls[0]?.[2]).toEqual({
+        target: "base-sha",
+      });
+    });
+  }
+
+  // What makes `D` safe to press on a checkout carrying no commits of its
+  // own beyond its base: no fork point resolves, and the review falls back
+  // to the working tree rather than opening an empty one. (A main checkout
+  // with unpushed commits DOES have a fork point against `origin/main`, and
+  // `D` there is meant to show them.)
+  it("D falls back to the working tree when there is no fork point", async () => {
+    resolveMergeBaseSpy.mockImplementation(async () => null);
+    await renderWithSession();
+    setup.mockInput.pressKey("D");
+    await settleReview();
+    expect(resolveMergeBaseSpy).toHaveBeenCalled();
+    expect(runHunkReviewSpy.mock.calls[0]?.[2]).toEqual({ target: undefined });
+  });
+
   it("drops a second d-press while a review is in flight", async () => {
     // Hold runHunkReview pending so reviewInFlight stays true across the
     // second press. A rapid double-d must not race two suspend/spawn/resume
@@ -1949,6 +2230,60 @@ describe("App review (d)", () => {
     await new Promise((r) => setTimeout(r, 0));
     await setup.renderOnce();
     expect(setup.captureCharFrame()).toContain("Review failed: boom");
+  });
+
+  // The dead end the fixed pair creates, on the row it lands on most: an
+  // agent that committed everything has nothing uncommitted, so `d` refuses.
+  // The refusal has to say where the diff went, or this is exactly the
+  // papercut the branch review was built to remove.
+  it("points at D when d finds nothing uncommitted", async () => {
+    runHunkReviewSpy.mockImplementation(async () => ({
+      ok: false,
+      error: "no changes to review",
+      empty: true,
+    }));
+    await renderWithSession({}, WORKTREE_SESSION);
+    setup.mockInput.pressKey("d");
+    await settleReview();
+    await new Promise((r) => setTimeout(r, 0));
+    await setup.renderOnce();
+    expect(squish(setup.captureCharFrame())).toContain(
+      squish("no changes to review (D reviews the branch)"),
+    );
+  });
+
+  // Already in branch mode: there is no other key to point at, and the hint
+  // would be advice to press the key just pressed.
+  it("does not point at D when D itself finds nothing", async () => {
+    runHunkReviewSpy.mockImplementation(async () => ({
+      ok: false,
+      error: "no changes to review",
+      empty: true,
+    }));
+    await renderWithSession({}, WORKTREE_SESSION);
+    setup.mockInput.pressKey("D");
+    await settleReview();
+    await new Promise((r) => setTimeout(r, 0));
+    await setup.renderOnce();
+    const frame = squish(setup.captureCharFrame());
+    expect(frame).toContain(squish("no changes to review"));
+    expect(frame).not.toContain(squish("D reviews the branch"));
+  });
+
+  // A real failure is not the empty case, so it never carries the hint.
+  it("does not point at D on a refusal that is not the empty one", async () => {
+    runHunkReviewSpy.mockImplementation(async () => ({
+      ok: false,
+      error: "not a git repository",
+    }));
+    await renderWithSession({}, WORKTREE_SESSION);
+    setup.mockInput.pressKey("d");
+    await settleReview();
+    await new Promise((r) => setTimeout(r, 0));
+    await setup.renderOnce();
+    const frame = squish(setup.captureCharFrame());
+    expect(frame).toContain(squish("Review failed: not a git repository"));
+    expect(frame).not.toContain(squish("D reviews the branch"));
   });
 
   it("recovers when runHunkReview rejects unexpectedly", async () => {
@@ -2306,8 +2641,8 @@ describe("App fork (F / context menu)", () => {
 
       // Ordinary new-session dialogs still refresh on every open so a
       // long-lived picker can discover agents installed since startup.
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       setup.mockInput.pressKey("n");
       await settle();
@@ -2480,8 +2815,8 @@ describe("App fork (F / context menu)", () => {
 
       // Dismiss the submitted fork and start drafting an unrelated session
       // while its daemon request is still pending.
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       setup.mockInput.pressKey("n");
       await settle();
@@ -2839,10 +3174,8 @@ describe("App new session dialog", () => {
     const { spawns, restore } = withDaemon();
     try {
       await openDialog();
-      setup.mockInput.pressEscape();
-      // A bare ESC byte is the prefix of every escape sequence, so the key
-      // parser holds it briefly before deciding it stands alone.
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       expect(setup.captureCharFrame()).not.toContain("New session");
       expect(spawns).toHaveLength(0);
@@ -2937,8 +3270,8 @@ describe("App new session dialog", () => {
       await setup.renderOnce();
       setup.mockInput.pressKey("j");
       await setup.renderOnce();
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       // The dialog survives (escape was the overlay's), the held agent is
       // unchanged, and the list is gone.
@@ -3633,8 +3966,8 @@ describe("App new session dialog", () => {
       expect(setup.captureCharFrame()).toContain("connection refused");
 
       // Close, bring the daemon back, reopen: the list is fetched again.
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       failNext = false;
       setup.mockInput.pressKey("n");
@@ -3798,8 +4131,8 @@ describe("App new session dialog", () => {
       expect(calls).toBe(1);
       expect(setup.captureCharFrame()).not.toContain("Codex");
 
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       setup.mockInput.pressKey("n");
       await settle();
@@ -3912,8 +4245,8 @@ describe("App new session dialog", () => {
       const byKey = setup.captureCharFrame();
       expect(byKey).toContain("/where/the/picker/ran");
 
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
 
       const byMouse = await openGroupMenuNewSession();
@@ -3957,8 +4290,8 @@ describe("App new session dialog", () => {
       expect(byKey).toContain("/code/myapp");
       expect(byKey).not.toContain("worktrees/feature");
 
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
 
       const byMouse = await openGroupMenuNewSession();
@@ -4588,7 +4921,7 @@ describe("App move-changes menu gate", () => {
       // Open on the first row, then dismiss and open on the second.
       await setup.mockMouse.click(5, 1, MouseButtons.RIGHT);
       await setup.renderOnce();
-      setup.mockInput.pressKey("escape");
+      deliverEscape(setup.renderer);
       await setup.renderOnce();
       await setup.mockMouse.click(5, 2, MouseButtons.RIGHT);
       await setup.renderOnce();
@@ -5144,7 +5477,7 @@ describe("App move-changes reporting", () => {
       expect(exitSpy).not.toHaveBeenCalled();
       expect(squish(setup.captureCharFrame())).toContain("deadbee1234");
 
-      setup.mockInput.pressKey("escape");
+      deliverEscape(setup.renderer);
       await settle();
       expect(exitSpy).toHaveBeenCalled();
     } finally {
@@ -5196,7 +5529,7 @@ describe("App move-changes reporting", () => {
 
       // Dismissed by a keypress, and the dialog it was raised over is still
       // there to correct and retry.
-      setup.mockInput.pressKey("escape");
+      deliverEscape(setup.renderer);
       await setup.renderOnce();
       const after = squish(setup.captureCharFrame());
       expect(after).not.toContain("gitstashapplyabc1234def");
@@ -5543,8 +5876,8 @@ describe("App fork into worktree", () => {
     const { spawns, restore } = withForkDaemon();
     try {
       await openForkDialog();
-      setup.mockInput.pressEscape();
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
 
       expect(spawns).toHaveLength(0);
@@ -5817,10 +6150,8 @@ describe("App row menu (m)", () => {
       await press("m");
       expect(setup.captureCharFrame()).toContain("Attach");
 
-      setup.mockInput.pressEscape();
-      // A lone ESC byte is only unambiguous once the parser has waited out
-      // the sequence it could have started; every escape test here does this.
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       expect(setup.captureCharFrame()).not.toContain("Attach");
     } finally {
@@ -6609,7 +6940,9 @@ describe("App copy last response", () => {
     try {
       await renderRow();
       await openCopyDialog();
-      await press("escape");
+      deliverEscape(setup.renderer);
+      await settle();
+      await setup.renderOnce();
       const frame = squish(setup.captureCharFrame());
       expect(frame).not.toContain("Lastresponse");
       expect(asked).toEqual([]);
@@ -7026,10 +7359,8 @@ describe("App hand off to", () => {
     try {
       await renderRows();
       await pickTarget();
-      setup.mockInput.pressEscape();
-      // A bare ESC byte is the prefix of every escape sequence, so the key
-      // parser holds it briefly before deciding it stands alone.
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       const frame = squish(setup.captureCharFrame());
       // Neither the dialog nor the pick mode it came from is left behind.
@@ -7141,10 +7472,8 @@ describe("App hand off to", () => {
     try {
       await renderRows();
       await startPick();
-      setup.mockInput.pressEscape();
-      // A bare ESC byte is the prefix of every escape sequence, so the key
-      // parser holds it briefly before deciding it stands alone.
-      await settle(20);
+      deliverEscape(setup.renderer);
+      await settle();
       await setup.renderOnce();
       expect(posted).toEqual([]);
       expect(squish(setup.captureCharFrame())).not.toContain("esccancel");
@@ -7229,7 +7558,7 @@ describe("App worktrees panel (W)", () => {
    * Route the panel's two reads (and App's own onMount fetches) without
    * touching whatever `fetch` a neighbouring test installed.
    */
-  function mockWorktreeFetch(rows: unknown[]) {
+  function mockWorktreeFetch(rows: unknown[], prs: unknown[] = []) {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = ((input: string | URL | Request) => {
       const url =
@@ -7244,7 +7573,14 @@ describe("App worktrees panel (W)", () => {
                 { repoRoot: "/code/myapp", repoName: "myapp", worktrees: rows },
               ],
             }
-          : {};
+          : url.includes("/prs")
+            ? {
+                repos: [
+                  { repoRoot: "/code/myapp", repoName: "myapp", prs },
+                ],
+                errors: [],
+              }
+            : {};
       return Promise.resolve(
         new Response(JSON.stringify(body), {
           headers: { "Content-Type": "application/json" },
@@ -7265,8 +7601,20 @@ describe("App worktrees panel (W)", () => {
     rows: unknown[],
     sessionOverrides: Record<string, unknown> = {},
     extraSessions: Record<string, unknown>[] = [],
+    prs: unknown[] = [],
   ) {
-    const restore = mockWorktreeFetch(rows);
+    const restore = mockWorktreeFetch(rows, prs);
+    // App hard-codes `effects={liveEffects}`, which is right for production
+    // and means an App-level test reaches the REAL `open` and `pbcopy`: the
+    // panel's required-prop guarantee stops at its own mount site, and this
+    // is the other side of it. `o` and `y` on a panel row are one keypress
+    // from a browser window, so the seam is stubbed here as well. spyOn, not
+    // mock.module, which leaks across files.
+    const openSpy = spyOn(liveEffects, "openUrl").mockReturnValue(true);
+    const copySpy = spyOn(liveEffects, "copyText").mockReturnValue({
+      osc52: true,
+      local: false,
+    });
     await renderApp(120, 24, { groupBy: "none" });
     sseCallbacks!.onInit(
       [
@@ -7295,7 +7643,13 @@ describe("App worktrees panel (W)", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await setup.renderOnce();
     return {
-      restore,
+      restore: () => {
+        openSpy.mockRestore();
+        copySpy.mockRestore();
+        restore();
+      },
+      openSpy,
+      copySpy,
       frame: async () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
         await setup.renderOnce();
@@ -7303,6 +7657,88 @@ describe("App worktrees panel (W)", () => {
       },
     };
   }
+
+  // The App half of the checked-out-PR return cursor. Enter on a PR whose
+  // head IS checked out here routes through `spawnInWorktree`, because the
+  // destination is the worktree holding it — but the ROW is the PR, and
+  // `initialView` reads the return cursor to pick the view. While that
+  // branch sent the worktree's PATH, cancelling the dialog came back to the
+  // Worktrees view, where the adjacent not-checked-out row came back right.
+  it("returns to the PR view after cancelling out of a checked-out PR", async () => {
+    const held = {
+      ...WORKTREE_ROW,
+      path: "/code/myapp/wt/pr",
+      name: "pr-7",
+      branch: "feat/seven",
+      tip: "sha-7",
+    };
+    const { restore, frame } = await openPanel(
+      [held],
+      // The session lives in the MAIN checkout, so the revalidating jump
+      // does not fire and the dialog is what opens.
+      { cwd: "/code/myapp" },
+      [],
+      [
+        {
+          number: 7,
+          title: "seven",
+          url: "https://github.com/o/r/pull/7",
+          author: "epilande",
+          isDraft: false,
+          reviewDecision: null,
+          ciStatus: null,
+          headRefName: "feat/seven",
+          headRefOid: "sha-7",
+        },
+      ],
+    );
+    try {
+      setup.mockInput.pressKey("l");
+      const prs = await frame();
+      expect(prs).toContain("#7 seven");
+      expect(prs).toContain("checked out in pr-7");
+
+      setup.mockInput.pressEnter();
+      expect(await frame()).toContain("New session in worktree");
+
+      deliverEscape(setup.renderer);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const back = await frame();
+
+      // The PR VIEW, on the PR row — not the Worktrees view on the path.
+      expect(back).toContain("#7 seven");
+      expect(back).toContain("checked out in pr-7");
+      expect(back).not.toContain("main checkout");
+    } finally {
+      restore();
+    }
+  });
+
+  /**
+   * The other side of `381680b`. The panel's `effects` prop is required, so a
+   * PANEL test cannot reach the real `open` or `pbcopy` by forgetting; App
+   * hard-codes `liveEffects`, so an APP test could. Nothing pressed `o` or
+   * `y` here, which made it latent rather than live, and latent is how the
+   * first one shipped.
+   */
+  it("cannot reach the real opener or clipboard from an App mount", async () => {
+    const { restore, frame, openSpy, copySpy } = await openPanel([
+      WORKTREE_ROW,
+    ]);
+    try {
+      setup.mockInput.pressKey("y");
+      await frame();
+      expect(copySpy).toHaveBeenCalled();
+
+      setup.mockInput.pressKey("o");
+      await frame();
+      // No PR on this row, so the opener is correctly never asked; the point
+      // is that the seam is the stub either way.
+      expect(openSpy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
 
   it("opens over the selected row's repo", async () => {
     const { restore, frame } = await openPanel([WORKTREE_ROW]);
@@ -7388,6 +7824,27 @@ describe("App worktrees panel (W)", () => {
       expect(shown).toContain(squish("New session in worktree"));
       expect(shown).toContain("feature");
       expect(switchToPaneSpy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  // The picker's `d` points an empty working-tree review at `D`. The panel
+  // has no `D` (Shift+D is its dirty-row opt-in) and its `d` is already the
+  // branch review, so the hint must not reach its refusal.
+  it("does not point at D when the panel's own review finds nothing", async () => {
+    runHunkReviewSpy.mockImplementation(async () => ({
+      ok: false,
+      error: "no changes to review",
+      empty: true,
+    }));
+    const { restore, frame } = await openPanel([WORKTREE_ROW]);
+    try {
+      setup.mockInput.pressKey("d");
+      await frame();
+      const shown = squish(await frame());
+      expect(shown).toContain(squish("Review failed: no changes to review"));
+      expect(shown).not.toContain(squish("D reviews the branch"));
     } finally {
       restore();
     }
@@ -7557,9 +8014,24 @@ describe("App worktrees panel (W)", () => {
     const { restore, frame } = await openPanel([WORKTREE_ROW]);
     try {
       setup.mockInput.pressKey("d");
-      const shown = squish(await frame());
-      expect(shown).toContain(squish("no agent to send to"));
-      expect(shown).not.toContain(squish("Send review comments"));
+      const raw = await frame();
+      // Per LINE, not over the squished whole frame. Two constraints collide
+      // here. `squish` concatenates every row, so the panel's own rows land
+      // inside the toast's wrapped sentence and break any multi-word match.
+      // But the discriminating word is `agent`: the tail `send to)` is shared
+      // with `captured (no pane to send to)`, the PANELESS-session message, so
+      // asserting the tail let a regression that bound a stray session to this
+      // row stay green. Matching one line keeps both.
+      const lines = raw.split("\n").map((line) => squish(line));
+      expect(
+        lines.some((line) => line.includes(squish("captured (no agent to"))),
+      ).toBe(true);
+      // The message this test is NOT about, named so the two cannot be
+      // confused again.
+      expect(lines.some((line) => line.includes(squish("no pane to")))).toBe(
+        false,
+      );
+      expect(squish(raw)).not.toContain(squish("Send review comments"));
     } finally {
       restore();
     }
@@ -7666,14 +8138,12 @@ describe("App worktrees panel (W)", () => {
       setup.mockInput.pressEnter();
       const dialog = await frame();
       expect(squish(dialog)).toContain(squish("New session in worktree"));
-      expect(dialog).not.toContain("Worktrees ·");
+      expect(dialog).not.toContain("Pull Requests");
 
-      setup.mockInput.pressEscape();
-      // A lone ESC needs the input parser disambiguation window before it
-      // is delivered as a key at all.
-      await new Promise((r) => setTimeout(r, 30));
+      deliverEscape(setup.renderer);
+      await new Promise((r) => setTimeout(r, 0));
       const shown = await frame();
-      expect(shown).toContain("Worktrees ·");
+      expect(shown).toContain("Pull Requests");
       expect(squish(shown)).not.toContain(squish("New session in worktree"));
       const lines = shown.split("\n");
       expect(lines.find((l) => l.includes("feature"))).toContain("┃");
@@ -7742,8 +8212,8 @@ describe("App worktrees panel (W)", () => {
       await new Promise((r) => setTimeout(r, 0));
       await setup.renderOnce();
       const before = urls.length;
-      setup.mockInput.pressEscape();
-      await new Promise((r) => setTimeout(r, 30));
+      deliverEscape(setup.renderer);
+      await new Promise((r) => setTimeout(r, 0));
       await setup.renderOnce();
       await new Promise((r) => setTimeout(r, 0));
       await setup.renderOnce();
@@ -7769,10 +8239,10 @@ describe("App worktrees panel (W)", () => {
       await frame();
       setup.mockInput.pressKey("n");
       expect(squish(await frame())).toContain(squish("New session"));
-      setup.mockInput.pressEscape();
-      await new Promise((r) => setTimeout(r, 30));
+      deliverEscape(setup.renderer);
+      await new Promise((r) => setTimeout(r, 0));
       const shown = await frame();
-      expect(shown).not.toContain("Worktrees ·");
+      expect(shown).not.toContain("Pull Requests");
     } finally {
       restore();
     }

@@ -95,8 +95,9 @@ function claudePairCost(
 export function decideNewSessionPane(
   obs: NewSessionPaneObservation,
 ): NewSessionPaneDecision {
-  const allProcPanes = pairProcsWithPanes(obs.processes, obs.panes);
-  const byCwd = buildProcPaneMapByEncodedCwd(obs.processes, obs.panes);
+  const pairing = { processTree: obs.processTree };
+  const allProcPanes = pairProcsWithPanes(obs.processes, obs.panes, pairing);
+  const byCwd = buildProcPaneMapByEncodedCwd(obs.processes, obs.panes, pairing);
   const matches = candidatesForSession(
     obs.transcriptCwd,
     obs.encodedProjectPath,
@@ -233,8 +234,13 @@ export function decideInitialClaudeBatch(
     return b.mtimeMs - a.mtimeMs;
   });
 
-  const allProcPanes = pairProcsWithPanes(obs.processes, obs.panes);
-  const cwdToProcsMap = buildProcPaneMapByEncodedCwd(obs.processes, obs.panes);
+  const pairing = { processTree: obs.processTree };
+  const allProcPanes = pairProcsWithPanes(obs.processes, obs.panes, pairing);
+  const cwdToProcsMap = buildProcPaneMapByEncodedCwd(
+    obs.processes,
+    obs.panes,
+    pairing,
+  );
   const claimedPaneIds = new Set<string>();
 
   // Working model of sessions, updated as the batch creates/replaces.
@@ -286,6 +292,11 @@ export function decideInitialClaudeBatch(
       : null;
 
     if (markerMatch) {
+      // The transcript's own cwd when the drift fallback already read one,
+      // else the bound process's — both are the real path, where decoding
+      // the project dir name is a lossy guess (issue #156). `proc.cwd` is
+      // non-null for anything `pairProcsWithPanes` returns.
+      const realCwd = transcriptCwd ?? markerMatch.proc.cwd ?? null;
       actions.push({
         type: "create",
         sessionId,
@@ -294,12 +305,13 @@ export function decideInitialClaudeBatch(
         pid: markerMatch.proc.pid,
         provenance: "marker",
         confidence: "authoritative",
+        cwd: realCwd,
       });
       claimedPaneIds.add(markerMatch.pane.paneId);
       const created: ReplaceableSessionSlice = {
         id: sessionId,
         agentType: "claude",
-        cwd: decodeProjectPath(encodedProjectPath),
+        cwd: realCwd ?? decodeProjectPath(encodedProjectPath),
         encodedCwd: encodedProjectPath,
         tmuxPane: null,
         logPath: path,
@@ -326,6 +338,13 @@ export function decideInitialClaudeBatch(
         },
       );
       if (replace) {
+        // Real cwd over the lossy decode, as in the marker arm. The verify
+        // callback above only passed because `matchingProcs` holds this pane.
+        const realCwd =
+          transcriptCwd ??
+          matchingProcs.find((mp) => mp.pane.paneId === replace.paneId)?.proc
+            .cwd ??
+          null;
         actions.push({
           type: "replace",
           removeSessionId: replace.removeSessionId,
@@ -334,6 +353,7 @@ export function decideInitialClaudeBatch(
           path,
           paneId: replace.paneId,
           pid: markerPid,
+          cwd: realCwd,
         });
         // Model: replaced session leaves; newcomer joins bound to its pane.
         const idx = model.findIndex((s) => s.id === replace.removeSessionId);
@@ -342,7 +362,7 @@ export function decideInitialClaudeBatch(
         const replacement: ReplaceableSessionSlice = {
           id: sessionId,
           agentType: "claude",
-          cwd: decodeProjectPath(encodedProjectPath),
+          cwd: realCwd ?? decodeProjectPath(encodedProjectPath),
           encodedCwd: encodedProjectPath,
           tmuxPane: null,
           logPath: path,
@@ -428,6 +448,7 @@ export function decideInitialClaudeBatch(
     for (const [s, c] of result.bound) {
       const entry = group[s];
       const mp = candidates[c];
+      const realCwd = entry.transcriptCwd ?? mp.proc.cwd ?? null;
       actions.push({
         type: "create",
         sessionId: entry.sessionId,
@@ -436,12 +457,13 @@ export function decideInitialClaudeBatch(
         pid: mp.proc.pid,
         provenance: "start-time",
         confidence: "probable",
+        cwd: realCwd,
       });
       claimedPaneIds.add(mp.pane.paneId);
       const created: ReplaceableSessionSlice = {
         id: entry.sessionId,
         agentType: "claude",
-        cwd: entry.transcriptCwd ?? decodeProjectPath(entry.encodedProjectPath),
+        cwd: realCwd ?? decodeProjectPath(entry.encodedProjectPath),
         encodedCwd: entry.encodedProjectPath,
         tmuxPane: null,
         logPath: entry.path,
@@ -463,6 +485,8 @@ export function decideInitialClaudeBatch(
         type: "create-unbound",
         sessionId: entry.sessionId,
         path: entry.path,
+        // No pane to read a cwd from: only the transcript can say.
+        cwd: entry.transcriptCwd,
       });
     }
   }

@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   readlinkSync,
   rmSync,
   symlinkSync,
@@ -21,8 +22,12 @@ import {
   resolveBase,
   resolveWorktreeName,
   slugForFork,
+  slugForIssue,
+  slugForPR,
   slugFromPrompt,
   slugify,
+  pickIssueWorktree,
+  isIssueWorktreeName,
   withRepoLock,
   worktreePathFor,
 } from "./worktree-create";
@@ -43,6 +48,15 @@ async function git(cwd: string, args: string[]): Promise<string> {
     throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${res.stderr}`);
   }
   return res.stdout.trim();
+}
+
+/** Where a branch's recorded base lives; see `recordBranchBase`. */
+const CONFIG_KEY = (branch: string) => `branch.${branch}.ccmux-base`;
+
+/** A config value, or null for a key that is not set (git exits non-zero). */
+async function readConfig(repo: string, key: string): Promise<string | null> {
+  const res = await runGit(repo, ["config", "--get", key]);
+  return res.exitCode === 0 ? res.stdout.trim() : null;
 }
 
 /** `lstatSync` throws on an absent path, and absent is an answer here. */
@@ -594,6 +608,99 @@ describe("createWorktree", () => {
     expect(out.result.base).toBeUndefined();
   });
 
+  // The picker's branch review asks git where the branch came from rather
+  // than guessing the repo's default branch, which is only possible if the
+  // answer was written down at the one moment it is known.
+  it("records the base the branch was cut from in branch config", async () => {
+    const repo = await makeRepo();
+
+    const out = await createWorktree(repo, { name: "fix-sidebar" });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    // A ref NAME, not the sha it pointed at: the merge-base still lands on
+    // the fork point after the user merges the base back in. Fully
+    // qualified, so it cannot be re-read as a tag or a rev expression.
+    expect(await readConfig(repo, CONFIG_KEY("fix-sidebar"))).toBe(
+      "refs/heads/main",
+    );
+    expect(out.result.base).toBe("main");
+  });
+
+  // A base whose meaning depends on WHERE it is evaluated is the whole risk:
+  // the record is read back inside the worktree, where HEAD is the branch's
+  // own tip. Stored verbatim, `HEAD~1` reviews the branch against its own
+  // parent — silently, with no error and no fallback.
+  it("pins a HEAD-relative base to the commit it named in the main checkout", async () => {
+    const repo = await makeRepo();
+    writeFileSync(join(repo, "second.txt"), "2\n");
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-m", "second"]);
+    const parent = await git(repo, ["rev-parse", "HEAD~1"]);
+
+    const out = await createWorktree(repo, {
+      name: "off-parent",
+      base: "HEAD~1",
+    });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(await readConfig(repo, CONFIG_KEY("off-parent"))).toBe(parent);
+  });
+
+  // `@` is `HEAD`, which git DOES name here (`refs/heads/main`) while the
+  // main checkout is attached — so the record is that name, and the thing
+  // that matters is what it means from inside the worktree: the base it was
+  // cut from, never the worktree's own head.
+  it("records a base of @ as the ref it names, not the worktree's own head", async () => {
+    const repo = await makeRepo();
+    const mainTip = await git(repo, ["rev-parse", "HEAD"]);
+
+    const out = await createWorktree(repo, { name: "off-at", base: "@" });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    const stored = await readConfig(repo, CONFIG_KEY("off-at"));
+    expect(stored).not.toBeNull();
+    // A commit of the worktree's own moves its HEAD off the base; the record
+    // must still resolve to the base.
+    writeFileSync(join(out.result.path, "work.txt"), "w\n");
+    await git(out.result.path, ["add", "-A"]);
+    await git(out.result.path, ["commit", "-m", "agent work"]);
+    expect(await git(out.result.path, ["rev-parse", stored ?? ""])).toBe(
+      mainTip,
+    );
+    expect(await git(out.result.path, ["rev-parse", "HEAD"])).not.toBe(mainTip);
+  });
+
+  // A reused branch was not cut from the base, so a record would misdescribe
+  // where its history comes from - the same reason `result.base` is undefined.
+  it("records nothing when it reuses an existing branch", async () => {
+    const repo = await makeRepo();
+    await git(repo, ["branch", "already-there"]);
+
+    const out = await createWorktree(repo, { name: "already-there" });
+
+    expect(out.ok).toBe(true);
+    expect(await readConfig(repo, CONFIG_KEY("already-there"))).toBeNull();
+  });
+
+  // A DETACHED main checkout resolves its base as the literal "HEAD", which
+  // read back from the worktree would name the worktree's own head and make
+  // the merge-base the branch tip itself. The sha is stored instead.
+  it("stores a sha rather than the literal HEAD for a detached base", async () => {
+    const repo = await makeRepo();
+    const head = await git(repo, ["rev-parse", "HEAD"]);
+    await git(repo, ["checkout", "-q", "--detach"]);
+
+    const out = await createWorktree(repo, { name: "off-detached" });
+
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.result.base).toBe("HEAD");
+    expect(await readConfig(repo, CONFIG_KEY("off-detached"))).toBe(head);
+  });
+
   // Two tasks that open the same way derive one slug, and there is no name
   // here anyone typed, so joining the first agent's worktree and branch would
   // be a collision the user never sees. "Start three agents on this prompt" is
@@ -1027,5 +1134,305 @@ describe("withRepoLock", () => {
     ]);
 
     expect(order).toEqual(["b", "a"]);
+  });
+});
+
+describe("slugForPR / slugForIssue", () => {
+  it("prefixes with the number and slugifies the label", () => {
+    expect(slugForPR(7, "fix/flaky-binder")).toBe("pr-7-fix-flaky-binder");
+    expect(slugForIssue(45, "spawn: --pr and --issue flags")).toBe(
+      "issue-45-spawn-pr-and-issue-flags",
+    );
+  });
+
+  // Budgeted INSIDE the cap, like `slugForFork`: `resolveWorktreeName`
+  // re-slugifies whatever it is handed, so a name over the cap would be
+  // trimmed there and could lose the prefix that makes it unique.
+  it("budgets the prefix inside the slug cap", () => {
+    const pr = slugForPR(12345, "a".repeat(80));
+    expect(pr.length).toBeLessThanOrEqual(40);
+    expect(pr.startsWith("pr-12345-")).toBe(true);
+    expect(slugify(pr)).toBe(pr);
+
+    const issue = slugForIssue(12345, "b".repeat(80));
+    expect(issue.length).toBeLessThanOrEqual(40);
+    expect(slugify(issue)).toBe(issue);
+  });
+
+  // Claude Code puts its own fetch-only PR checkouts at `pr-<n>`, so bare
+  // `pr-<n>` is the one name this must never produce.
+  it("never collapses to bare pr-<n>", () => {
+    expect(slugForPR(7, "日本語")).toBe("pr-7-head");
+    expect(slugForPR(7, "")).toBe("pr-7-head");
+  });
+
+  it("falls back to bare issue-<n>, which collides with nothing", () => {
+    expect(slugForIssue(45, "!!!")).toBe("issue-45");
+  });
+});
+
+describe("pickIssueWorktree", () => {
+  it("takes the shortest family-exact name", () => {
+    const rows = [
+      { name: "issue-144-notifications-2", path: "/b" },
+      { name: "issue-144-notifications", path: "/a" },
+      { name: "issue-1444-other", path: "/c" },
+    ];
+    expect(pickIssueWorktree(144, rows)?.path).toBe("/a");
+    expect(isIssueWorktreeName("issue-1444-other", 144)).toBe(false);
+    expect(pickIssueWorktree(14, rows)).toBeNull();
+  });
+});
+
+describe("createWorktree with a branch override", () => {
+  // A `--pr` spawn's directory is named after the PR while its branch has to
+  // be the PR's own head ref, so `git push` works out of the box.
+  it("cuts the given branch at the given base, under the given name", async () => {
+    const repo = await makeRepo();
+    const base = await git(repo, ["rev-parse", "HEAD"]);
+
+    const created = await createWorktree(repo, {
+      name: "pr-7-fix-flaky",
+      base,
+      branch: "fix/flaky-binder",
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.name).toBe("pr-7-fix-flaky");
+    expect(created.result.branch).toBe("fix/flaky-binder");
+    expect(created.result.branchCreated).toBe(true);
+    expect(created.result.path).toBe(worktreePathFor(repo, "pr-7-fix-flaky"));
+    expect(
+      await git(created.result.path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    ).toBe("fix/flaky-binder");
+    expect(await git(created.result.path, ["rev-parse", "HEAD"])).toBe(base);
+  });
+
+  it("checks out an existing branch of that name instead of cutting one", async () => {
+    const repo = await makeRepo();
+    await git(repo, ["branch", "fix/flaky-binder"]);
+
+    const created = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.branch).toBe("fix/flaky-binder");
+    // Reused, so nothing was cut and no base may be reported.
+    expect(created.result.branchCreated).toBe(false);
+    expect(created.result.base).toBeUndefined();
+  });
+
+  // A derived name normally refuses any candidate a branch is holding,
+  // because the create path would reuse that branch. With an override the
+  // name is a directory label and nothing else, so that test does not apply.
+  it("does not number past a same-named branch when the branch is overridden", async () => {
+    const repo = await makeRepo();
+    await git(repo, ["branch", "pr-7-fix-flaky"]);
+
+    const created = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.name).toBe("pr-7-fix-flaky");
+    expect(created.result.branch).toBe("fix/flaky-binder");
+  });
+
+  it("defaults the branch to the worktree name when no override is given", async () => {
+    const repo = await makeRepo();
+
+    const created = await createWorktree(repo, { name: "plain-name" });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.branch).toBe("plain-name");
+  });
+
+  // The record is keyed by BRANCH, and an override is exactly the case where
+  // the directory name is not it. Keyed by the name, the picker's branch
+  // review looks up a branch nothing ever created, finds no base and falls
+  // back to guessing the default one - silently, against the wrong base.
+  it("records the base under the branch, not the worktree name", async () => {
+    const repo = await makeRepo();
+
+    const created = await createWorktree(repo, {
+      name: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(await readConfig(repo, CONFIG_KEY("fix/flaky-binder"))).toBe(
+      "refs/heads/main",
+    );
+    expect(await readConfig(repo, CONFIG_KEY("pr-7-fix-flaky"))).toBeNull();
+  });
+
+  // A `--pr` spawn cuts the branch at the PR's own tip, so a record here
+  // would name the branch as its own review base and the picker's `D` would
+  // diff it against itself. Both keys are checked so this cannot pass by
+  // having recorded it under the other one.
+  it("records nothing under either key when the caller opts out", async () => {
+    const repo = await makeRepo();
+    const tip = await git(repo, ["rev-parse", "HEAD"]);
+
+    const created = await createWorktree(repo, {
+      name: "pr-7-fix-flaky",
+      base: tip,
+      branch: "fix/flaky-binder",
+      recordBase: false,
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.branchCreated).toBe(true);
+    expect(await readConfig(repo, CONFIG_KEY("fix/flaky-binder"))).toBeNull();
+    expect(await readConfig(repo, CONFIG_KEY("pr-7-fix-flaky"))).toBeNull();
+  });
+
+  // The caller validated the branch under a DIFFERENT acquisition of the repo
+  // lock, so a branch that appears in the window between the two must not be
+  // checked out as if it had passed those checks (issue #157).
+  it("refuses a branch that appeared after the caller settled it as absent", async () => {
+    const repo = await makeRepo();
+    await git(repo, ["branch", "fix/flaky-binder"]);
+
+    const created = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+      branchExists: false,
+    });
+
+    // The re-measure under the create's own lock refuses before git runs.
+    expect(created.ok).toBe(false);
+    if (created.ok) return;
+    expect(created.error).toContain("fix/flaky-binder");
+  });
+
+  // The other direction of the same race, and the one git does not refuse on
+  // its own: with a remote-tracking ref of the same name present, a plain
+  // `git worktree add <path> <branch>` DWIMs the deleted branch back into
+  // existence from `origin/<branch>` and exits 0. The fixture therefore has
+  // the remote-tracking ref, which is what makes this test about the create's
+  // own re-measure rather than about an error git happens to produce.
+  it("refuses a branch that vanished after the caller settled it as present", async () => {
+    const repo = await makeRepo();
+    await git(repo, [
+      "remote",
+      "add",
+      "origin",
+      "https://example.invalid/x.git",
+    ]);
+    await git(repo, [
+      "update-ref",
+      "refs/remotes/origin/fix/flaky-binder",
+      "HEAD",
+    ]);
+
+    const created = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+      branchExists: true,
+    });
+
+    expect(created.ok).toBe(false);
+    if (created.ok) return;
+    expect(created.error).toContain("fix/flaky-binder");
+    // `git` throws on a non-zero exit, so the absent case needs the raw runner.
+    const local = await runGit(repo, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      "refs/heads/fix/flaky-binder",
+    ]);
+    expect(local.exitCode).not.toBe(0);
+  });
+
+  it("still derives the answer for a caller that settles nothing", async () => {
+    const repo = await makeRepo();
+    await git(repo, ["branch", "fix/flaky-binder"]);
+
+    const created = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.branchCreated).toBe(false);
+  });
+
+  // A second `--pr` of a branch already checked out used to 400. Opening
+  // that checkout is what the source picker promises on Enter.
+  it("opens the worktree already holding the overridden branch", async () => {
+    const repo = await makeRepo();
+    const first = await createWorktree(repo, {
+      name: "parking",
+      branch: "fix/flaky-binder",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const second = await createWorktree(repo, {
+      derivedName: "pr-7-fix-flaky",
+      branch: "fix/flaky-binder",
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.result.created).toBe(false);
+    expect(realpathSync(second.result.path)).toBe(
+      realpathSync(first.result.path),
+    );
+    expect(existsSync(worktreePathFor(repo, "pr-7-fix-flaky"))).toBe(false);
+  });
+});
+
+describe("createWorktree reuseExisting", () => {
+  // The source picker's guarantee: a second `--issue` spawn opens the first
+  // checkout rather than numbering `issue-<n>-<slug>-2`.
+  it("opens the existing issue worktree instead of numbering a sibling", async () => {
+    const repo = await makeRepo();
+    const first = await createWorktree(repo, {
+      derivedName: "issue-144-old-title",
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const second = await createWorktree(repo, {
+      derivedName: "issue-144-new-title",
+      reuseExisting: (trees) => pickIssueWorktree(144, trees),
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.result.created).toBe(false);
+    expect(realpathSync(second.result.path)).toBe(
+      realpathSync(first.result.path),
+    );
+    expect(existsSync(worktreePathFor(repo, "issue-144-new-title"))).toBe(
+      false,
+    );
+  });
+
+  it("does not claim a longer issue number that merely starts with this one", async () => {
+    const repo = await makeRepo();
+    const other = await createWorktree(repo, {
+      derivedName: "issue-1444-other",
+    });
+    expect(other.ok).toBe(true);
+
+    const created = await createWorktree(repo, {
+      derivedName: "issue-144-notifications",
+      reuseExisting: (trees) => pickIssueWorktree(144, trees),
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.result.created).toBe(true);
+    expect(created.result.name).toBe("issue-144-notifications");
   });
 });

@@ -1,4 +1,5 @@
 import { appendFileSync } from "node:fs";
+import { readOwnTty } from "../../lib/tty";
 import { resolve, sep } from "node:path";
 import type { CliRenderer } from "@opentui/core";
 import { LOG_FILE, MAX_SEND_TEXT_CHARS } from "../../lib/config";
@@ -42,7 +43,19 @@ export interface HunkReviewNote {
 
 export type ReviewResult =
   | { ok: true; notes: HunkReviewNote[] }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      /**
+       * The refusal was "there is nothing here to review", not a failure:
+       * the pre-flight found the diff this review would have opened empty.
+       *
+       * A flag rather than a caller-side test on `error`, because the only
+       * caller that acts on it (the picker's `d`, which points at `D`) would
+       * otherwise be matching user-facing prose, and prose gets reworded.
+       */
+      empty?: true;
+    };
 
 type SpawnHunk = (
   cmd: string[],
@@ -278,27 +291,9 @@ async function defaultGitDiffNames(
 }
 
 async function defaultReadTty(): Promise<string | null> {
-  try {
-    // `tty` reports the pathname of the terminal on stdin (fd 0). Resolve this
-    // before the renderer suspends, while fd 0 is still our interactive tty; it
-    // matches the `tty` location hunk records for the child we spawn with
-    // inherited stdio. Exits non-zero ("not a tty") when stdin is redirected.
-    const proc = Bun.spawn(["tty"], {
-      stdin: "inherit",
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const [stdout, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    if (exitCode !== 0) return null;
-    const tty = stdout.trim();
-    return tty.startsWith("/dev/") ? tty : null;
-  } catch (err) {
-    debugLog(`tty resolution failed: ${err}`);
-    return null;
-  }
+  // Our own tty matches the `tty` location hunk records for the child we spawn
+  // with inherited stdio, which is what makes the match below work.
+  return readOwnTty(debugLog);
 }
 
 /**
@@ -489,13 +484,42 @@ export function spawnHunkDiff(
 }
 
 /**
- * The commit where a worktree's branch left the repo's default branch, or
+ * The base ref `worktree-create` recorded for this checkout's branch
+ * (`branch.<name>.ccmux-base`), or null when there is none to read: a
+ * detached HEAD, which has no branch to key the record off, a worktree ccmux
+ * did not create, or one created before the record existed.
+ *
+ * Read from the worktree, not the main checkout: branch config lives in the
+ * repo's COMMON config, which every worktree of it shares.
+ */
+async function readStoredBase(
+  worktreePath: string,
+  git: GitRun,
+): Promise<string | null> {
+  const branch = await git(worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const name = branch.stdout.trim();
+  if (branch.exitCode !== 0 || !name || name === "HEAD") return null;
+  const stored = await git(worktreePath, [
+    "config",
+    "--get",
+    `branch.${name}.ccmux-base`,
+  ]);
+  const ref = stored.stdout.trim();
+  return stored.exitCode === 0 && ref ? ref : null;
+}
+
+/**
+ * The commit where a worktree's branch left the base it was cut from, or
  * null when there is no such point to name.
  *
  * This, and not the base ref itself, is what a branch review compares
  * against: `hunk diff origin/main` in a branch that is behind would also show
  * everything that landed on main since the fork, which is not the work under
- * review. Null on a repo with no recognizable default branch, on an orphan or
+ * review. That holds for the RECORDED base too ({@link readStoredBase}),
+ * which is preferred over the default-branch heuristic because it is the one
+ * source that knows rather than guesses.
+ *
+ * Null on a repo with no recognizable default branch, on an orphan or
  * unrelated history, and on a checkout sitting ON the base itself, where the
  * caller falls back to the working-tree review rather than opening an empty
  * one.
@@ -509,8 +533,14 @@ export async function resolveMergeBase(
 ): Promise<string | null> {
   const git = deps.git ?? runGit;
   const baseRefs = deps.baseRefs ?? ((root: string) => resolveBaseRefs(root));
-  try {
-    const refs = await baseRefs(worktreePath);
+  /**
+   * The fork point with the first ref that answers, `null` when that ref IS
+   * HEAD, and `undefined` when no ref answered at all — the third value is
+   * what lets the recorded base be tried alone and only then fall through.
+   */
+  const forkPoint = async (
+    refs: string[],
+  ): Promise<string | null | undefined> => {
     for (const ref of refs) {
       const res = await git(worktreePath, ["merge-base", ref, "HEAD"]);
       const sha = res.stdout.trim();
@@ -520,6 +550,22 @@ export async function resolveMergeBase(
       if (head.stdout.trim() === sha) return null;
       return sha;
     }
+    return undefined;
+  };
+  try {
+    // The recorded base is asked first and ALONE: a worktree cut off a
+    // release branch, or off another worktree's branch, has a fork point no
+    // default-branch guess can name, so a record that answers settles it.
+    // Only a ref that no longer resolves (a deleted base branch) falls
+    // through, and the heuristic's candidates are not even listed until then
+    // — half a dozen `rev-parse` spawns a review would otherwise wait on.
+    const stored = await readStoredBase(worktreePath, git);
+    if (stored) {
+      const base = await forkPoint([stored]);
+      if (base !== undefined) return base;
+    }
+    const base = await forkPoint(await baseRefs(worktreePath));
+    if (base !== undefined) return base;
   } catch {
     // Git missing, a directory that moved, a repo too broken to answer: the
     // caller's fallback is a working-tree review, which is still useful.
@@ -572,7 +618,8 @@ export async function runHunkReview(
   const changes = target
     ? await gitDiffNames(root, target)
     : await gitStatus(root);
-  if (changes === "") return { ok: false, error: "no changes to review" };
+  if (changes === "")
+    return { ok: false, error: "no changes to review", empty: true };
 
   // Resolve our tty while fd 0 is still the interactive terminal (before
   // suspend). This is the discovery fallback when there's no paneId to match,

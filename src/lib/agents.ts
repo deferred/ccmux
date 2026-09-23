@@ -6,6 +6,50 @@ import type {
 } from "./preferences";
 import type { AttentionType, SessionStatus } from "../types/session";
 
+/**
+ * How one agent's tmux pane title reduces to a session summary.
+ *
+ * Every agent writes something to `pane_title`, but only five write a
+ * generated summary of the work; the rest echo the cwd (already the `project`
+ * column), their own run state (already `status`), or a static app name. So
+ * this is a per-agent rule rather than a generic filter, the same shape
+ * `terminalRules`, `errorRules` and `readyPattern` already take, for the same
+ * reason: once one agent needs its own pattern there is a table either way.
+ *
+ * An agent with no rule has no summary, and its cell falls back to the prompt.
+ * Applied by `summaryFromPaneTitle` (`src/lib/pane-summary.ts`), which is why
+ * the shape lives here and that module imports it, never the reverse.
+ */
+export interface SummaryTitleRule {
+  /**
+   * Matches a title this agent wrote; capture group 1 is the summary. A title
+   * that does not match has no summary.
+   *
+   * One regex, rather than a list of decorations to remove, because the match
+   * is what proves the title is the AGENT'S. tmux seeds `pane_title` to the
+   * hostname, so a pane whose agent has not written a title yet reads back as
+   * the machine name, and anything that merely stripped decoration would show
+   * that as the session's summary. Never `/g`: these are `test`ed and
+   * `exec`ed repeatedly, and a global regex carries `lastIndex` between calls.
+   */
+  match: RegExp;
+  /**
+   * Whole titles that carry no summary: the app's own name, the placeholder it
+   * shows before the first turn. Tested against the whole title and against
+   * the captured summary, so a rule can name either spelling.
+   */
+  empty?: RegExp[];
+  /**
+   * Whether a summary equal to the pane's cwd basename reads as empty.
+   *
+   * For omp, whose title is `π > <summary>` after a turn but
+   * `π > <cwd>` before one: the prefix is present either way, so only the
+   * cwd comparison separates a real session title from the directory name
+   * that the `project` column already carries.
+   */
+  cwdBasenameIsEmpty?: boolean;
+}
+
 export interface TerminalRule {
   matchAny?: string[];
   matchAll?: string[];
@@ -105,6 +149,18 @@ export interface AgentDef {
    */
   forkCommand?: string;
   /**
+   * The agent's own command-line flag for choosing a model, spliced after
+   * the launcher binary by `POST /spawn` when `--model` is given (`claude
+   * --model opus`). The value is validated to a shell-inert character set
+   * upstream, so it is never quoted.
+   *
+   * Undefined means "this agent's model flag has not been verified", and a
+   * model spawn is refused for it. Every built-in below declares one that
+   * was read from the agent's own `--help`; a custom agent declares its own
+   * in ccmux.json. Per-agent findings live in `docs/agent-adapters.md`.
+   */
+  modelFlag?: string;
+  /**
    * argv to stop a paneless background session (`trackingMode: "background"`)
    * given its daemon-short id. Only meaningful for agents with a background
    * mode whose worker pid is owned by a supervisor process, not by ccmux —
@@ -146,6 +202,12 @@ export interface AgentDef {
    * history and override path.
    */
   readyPattern?: RegExp;
+  /**
+   * How this agent's tmux pane title reduces to the `summary` column's text.
+   * Absent means the agent writes no summary worth showing, and the cell
+   * falls back to the last prompt. See `src/lib/pane-summary.ts`.
+   */
+  summaryTitle?: SummaryTitleRule;
   hooks?: {
     markerDir?: string;
     type?: string;
@@ -383,6 +445,9 @@ function mergeAgentConfig(base: AgentDef, override: AgentConfig): AgentDef {
   if (override.forkCommand !== undefined) {
     merged.forkCommand = override.forkCommand;
   }
+  if (override.modelFlag !== undefined) {
+    merged.modelFlag = override.modelFlag;
+  }
   if (override.sessionFilePattern !== undefined) {
     merged.sessionFilePattern = parseRegex(
       override.sessionFilePattern,
@@ -528,6 +593,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // "claude [options] [command] [prompt]" — "starts an interactive session
     // by default, use -p/--print for non-interactive output" (claude --help).
     promptCommand: "{bin} '{prompt}'",
+    modelFlag: "--model",
     // `--fork-session` resumes the transcript into a NEW session id rather
     // than appending to the source, so the original keeps its history and can
     // carry on being used. Verified against a live original, including one
@@ -590,6 +656,14 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // `agents.claude.readyPattern` in ccmux.json when Claude's glyph
     // changes again.
     readyPattern: /^[>❯]\s*$/,
+    // `✳ Say hello` idle, a braille spinner frame in the glyph's place while
+    // working, `✳ Claude Code` before the first turn. The glyph is stripped
+    // because `status` already draws that state, and the placeholder title is
+    // not a summary.
+    summaryTitle: {
+      match: /^[\u2733\u2800-\u28FF\s]+(.+)$/,
+      empty: [/^Claude Code$/],
+    },
     hooks: { markerDir: MARKERS_DIR, type: "claude" },
     // Stops a paneless `claude --bg` worker via Claude's own supervisor CLI.
     // The worker pid belongs to that supervisor, not ccmux, so a direct
@@ -640,6 +714,25 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     processMatch: /\bopencode\b/i,
     versionCommand: "opencode --version",
     terminalRules: [
+      // The question-tool picker (issue #137); the SDK has no `question.list`,
+      // so a question already open at plugin-load time is pane-only. Anchors
+      // captured across all four picker sub-modes on 1.18.19; `esc dismiss`
+      // does the discriminating. Do NOT "tighten" the pair to `↑↓ select`:
+      // the multi-select Confirm tab renders no arrow glyphs at all, so that
+      // anchor silently misses it (fixtures in terminal-detector.test.ts).
+      //
+      // MUST stay ahead of the permission rule below, whose `matchAny`
+      // includes the bare word "reject": model-authored question text can
+      // contain it, and a permission misclassification on the pane-only path
+      // attaches Approve/Deny buttons whose approve key is a bare Enter,
+      // which the picker consumes as a selection. See
+      // docs/agent-adapters.md for the full capture.
+      {
+        matchAll: ["esc dismiss", "enter "],
+        status: "waiting",
+        attentionType: "question",
+        pendingTool: null,
+      },
       {
         matchAny: ["allow once", "allow always", "reject", "[y/n]", "(y/n)"],
         status: "waiting",
@@ -670,6 +763,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // "--prompt  prompt to use", and its positional is a PROJECT PATH, not a
     // prompt. (`opencode run` is the non-interactive one.)
     promptCommand: "{bin} --prompt '{prompt}'",
+    modelFlag: "--model",
     // OpenCode's permission dialog is a horizontal option row
     // (`Allow once  Allow always  Reject`) navigated with Left/Right arrows;
     // Enter confirms the highlighted option. Verified e2e on OpenCode 1.18.3:
@@ -680,8 +774,10 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // right to Reject, then Enter. Escape is NOT a clean reject — it interrupts
     // the whole turn and leaves the session hung in `working`, so it is not
     // used for Deny and no `permissionReplyPrelude` is offered (a reply would
-    // have no safe cancel-to-composer key). No question detection exists for
-    // OpenCode, so no `answerPrelude`/`replyOnQuestion`. Buttons are
+    // have no safe cancel-to-composer key). Question waits (issue #137) are
+    // detected but carry no `answerPrelude`/`replyOnQuestion` either: Escape
+    // REJECTS the open question and ENDS the turn, so a typed reply has no
+    // safe abort key. Buttons are
     // additionally suppressed at delivery when this row aggregates >1
     // concurrently-waiting server-side session (`Session.ambiguousWait`; see
     // `aggregateOpenCodeMarkers`) — a keystroke lands on the shared pane's
@@ -707,6 +803,14 @@ export const BUILTIN_AGENTS: AgentDef[] = [
       args: ["opencode", "run", "--format", "json"],
       resumeArgs: ["opencode", "run", "--format", "json", "--session", "{id}"],
       output: { kind: "opencode-json" },
+    },
+    // Verified live on OpenCode 1.18.29: `OC | <session title>` after the
+    // first turn, the bare app name before it. Requiring the prefix rather
+    // than just stripping it keeps tmux's hostname seed from reading as a
+    // summary.
+    summaryTitle: {
+      match: /^OC \| (.+)$/,
+      empty: [/^OpenCode$/],
     },
   },
   {
@@ -801,6 +905,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // "codex [OPTIONS] [PROMPT]" — "[PROMPT] Optional user prompt to start the
     // session"; `codex exec` is the non-interactive subcommand.
     promptCommand: "{bin} '{prompt}'",
+    modelFlag: "--model",
     sessionFilePattern: CODEX_SESSION_FILE_PATTERN,
     // The marker, not the pane, decides when a Codex permission wait ends:
     // no hook fires on resolution, so the log adapter infers it and the pane
@@ -966,6 +1071,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // "agent [options] [command] [prompt...]" — "prompt  Initial prompt for
     // the agent"; -p/--print is the non-interactive mode.
     promptCommand: "{bin} '{prompt}'",
+    modelFlag: "--model",
     // `cursor` on PATH is the IDE GUI launcher (Cursor.app/.../bin/code);
     // the CLI agent ships as `cursor-agent`.
     executable: "cursor-agent",
@@ -973,6 +1079,24 @@ export const BUILTIN_AGENTS: AgentDef[] = [
       args: ["cursor-agent", "--print"],
       resumeArgs: ["cursor-agent", "--print", "--resume", "{id}"],
       output: { kind: "stdout" },
+    },
+    // `Hello Bot` after a turn, `Cursor Agent` before one. cursor writes the
+    // bare summary with no decoration at all, so any title is taken as one,
+    // and NOTHING in a title proves cursor wrote it. Two other writers reach
+    // the same pane_title and both need excluding: tmux's hostname seed,
+    // covered by the generic guard in `summaryFromPaneTitle`, and the shell,
+    // which on a common zsh/bash setup writes the cwd there on every prompt
+    // (`:/Users/me/Code/foo`, `:~/Code/foo`, the bare path, or bash's
+    // default `user@host:~/foo`). The path shapes are anchored so a real
+    // summary starting with a tilde, say `~50 lines`, still comes through.
+    summaryTitle: {
+      match: /^(.+)$/,
+      empty: [
+        /^Cursor Agent$/,
+        /^:?\//,
+        /^:?~(?:\/|$)/,
+        /^[^\s@]+@[^\s:]+:[~/]/,
+      ],
     },
     hooks: { markerDir: MARKERS_DIR, type: "cursor" },
   },
@@ -1049,6 +1173,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // interactive form is the separate "-i / --prompt-interactive  Run an
     // initial prompt interactively and continue the session".
     promptCommand: "{bin} -i '{prompt}'",
+    modelFlag: "--model",
     executable: "agy",
     invokeMode: {
       args: ["agy", "-p", "{prompt}"],
@@ -1069,6 +1194,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // provided prompt and continue in interactive mode" says so explicitly and
     // cannot be flipped by a future default change.
     promptCommand: "{bin} -i '{prompt}'",
+    modelFlag: "--model",
     commandPatterns: [
       /(?:^|\s)(?:npx|npm\s+exec)\s+@google\/gemini-cli(?:\s|$)/i,
       /\/\.bin\/gemini(?:\s|$)/i,
@@ -1214,6 +1340,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // prompt / omp \"List all .ts files in src/\"" vs "# Non-interactive mode
     // (process and exit) / omp -p \"...\"".
     promptCommand: "{bin} '{prompt}'",
+    modelFlag: "--model",
     // omp writes its JSONL transcript to
     // ~/.omp/agent/sessions/<encoded-cwd>/<ts>_<uuidv7>.jsonl, the same
     // filename shape as pi's, so the pattern is reused verbatim. ccmux does
@@ -1228,6 +1355,14 @@ export const BUILTIN_AGENTS: AgentDef[] = [
       // expose resumeArgs (sessionId is rejected at the daemon).
       args: ["omp", "-p", "{prompt}"],
       output: { kind: "stdout" },
+    },
+    // `π > Say hello` after a turn, `π ⠧ Say hello` while working, and
+    // `π > <cwd basename>` before the first turn. The prefix is there either
+    // way, so only the cwd comparison separates a session title from the
+    // directory name `project` already carries.
+    summaryTitle: {
+      match: /^π\s*[>\u2800-\u28FF]\s*(.+)$/,
+      cwdBasenameIsEmpty: true,
     },
     hooks: { markerDir: MARKERS_DIR, type: "omp" },
   },
@@ -1300,6 +1435,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // prompt / pi \"List all .ts files in src/\"" vs "# Non-interactive mode
     // (process and exit) / pi -p \"...\"". pi has NO --prompt flag at all.
     promptCommand: "{bin} '{prompt}'",
+    modelFlag: "--model",
     // pi writes its JSONL transcript to
     // ~/.pi/agent/sessions/--<encoded-cwd>--/<ts>_<uuidv7>.jsonl. ccmux does
     // not parse it in v1 (pi closes the file after each append, so the lsof
@@ -1413,6 +1549,7 @@ export const BUILTIN_AGENTS: AgentDef[] = [
     // execute this prompt". Copilot's `-p/--prompt` is explicitly the
     // non-interactive scripting mode.
     promptCommand: "{bin} -i '{prompt}'",
+    modelFlag: "--model",
     // Copilot holds `session-state/<uuid>/session.db` open (lsof-discoverable),
     // so the no-hooks path can recover the native session id from it.
     sessionFilePattern: COPILOT_SESSION_FILE_PATTERN,
@@ -1431,6 +1568,14 @@ export const BUILTIN_AGENTS: AgentDef[] = [
         "{id}",
       ],
       output: { kind: "stdout" },
+    },
+    // `Implement Hello Function - GitHub Copilot`: the summary with the app
+    // name appended, and bare it is the placeholder shown before a turn. The
+    // capture is lazy, so a summary carrying a " - " of its own keeps every
+    // part but the trailing app name.
+    summaryTitle: {
+      match: /^(.+?)\s*-\s*GitHub Copilot$/,
+      empty: [/^GitHub Copilot$/],
     },
     hooks: { markerDir: MARKERS_DIR, type: "copilot" },
   },
@@ -1494,6 +1639,7 @@ export function getAgents(preferences?: Preferences): AgentDef[] {
       resumeCommand: override.resumeCommand,
       promptCommand: override.promptCommand,
       forkCommand: override.forkCommand,
+      modelFlag: override.modelFlag,
       sessionFilePattern: override.sessionFilePattern
         ? parseRegex(
             override.sessionFilePattern,

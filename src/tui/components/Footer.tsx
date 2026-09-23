@@ -1,6 +1,6 @@
 import type { Component } from "solid-js";
 import { Switch, Match } from "solid-js";
-import { useTerminalDimensions } from "@opentui/solid";
+import { useSharedTerminalDimensions } from "../utils/use-shared-dimensions";
 import { DEFAULT_GROUP_BY, type GroupBy } from "../../lib/preferences";
 import { theme } from "../theme";
 
@@ -170,14 +170,17 @@ export function defaultHints(props: {
     // conditional on hunk being installed, so the columns it costs are only
     // ever spent on someone who can use it. Restart and Kill need no such
     // advertisement — they are the two actions every session list has.
-    ...(props.reviewable ? [{ text: "d review", rank: 2 }] : []),
+    // Both keys on one hint: `D` is the branch-vs-base half of the same
+    // integration, and a second segment for it would cost a column the line
+    // does not have.
+    ...(props.reviewable ? [{ text: "d/D review", rank: 2 }] : []),
     { text: "? help", rank: 5 },
     { text: "q quit", rank: 6 },
   ];
 }
 
 export const Footer: Component<FooterProps> = (props) => {
-  const dims = useTerminalDimensions();
+  const dims = useSharedTerminalDimensions();
   const hints = () =>
     fitHints(defaultHints(props), Math.max(1, dims().width - FOOTER_PADDING));
 

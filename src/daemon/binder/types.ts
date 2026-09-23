@@ -75,10 +75,16 @@ export interface ScanObservation {
   markerPidBySessionId: ReadonlyMap<string, number | null>;
 }
 
-/** A process paired with the pane whose tty it owns. */
+/**
+ * A process paired with the pane that hosts it, and how the join was made:
+ * `tty` (the process owns the pane's terminal) or `ancestry` (a
+ * pty-allocating wrapper kept the tty, so the pane's own pid had to be
+ * walked down to the agent). See `pairProcsWithPanes`.
+ */
 export interface ProcPaneMatch {
   proc: ProcessInfo;
   pane: TmuxPane;
+  provenance: "tty" | "ancestry";
 }
 
 /**
@@ -104,6 +110,12 @@ export type NewSessionPaneDecision =
 export interface NewSessionPaneObservation {
   processes: readonly ProcessInfo[];
   panes: readonly TmuxPane[];
+  /**
+   * Enables the pairing's ancestry fallback (`pairProcsWithPanes`), which is
+   * the only way a wrapper-hosted agent (`script -q /dev/null claude`) is
+   * reachable here: its tty belongs to no pane. Omit for tty-only pairing.
+   */
+  processTree?: ProcessTreeLike;
   sessionId: string;
   encodedProjectPath: string;
   /** Raw cwd from the session's transcript entries, when known. */
@@ -175,6 +187,8 @@ export interface InitialBatchItem {
 export interface InitialBatchObservation {
   processes: readonly ProcessInfo[];
   panes: readonly TmuxPane[];
+  /** Enables the pairing's ancestry fallback; see `NewSessionPaneObservation`. */
+  processTree?: ProcessTreeLike;
   /** Existing sessions, manager order (mutated copies tracked internally). */
   sessions: readonly ReplaceableSessionSlice[];
   markerPidBySessionId: ReadonlyMap<string, number | null>;
@@ -195,7 +209,15 @@ export interface InitialBatchObservation {
   getTranscriptCwd(path: string): string | null;
 }
 
-/** Ordered actions the watcher applies after the batch decision. */
+/**
+ * Ordered actions the watcher applies after the batch decision.
+ *
+ * The creating arms carry `cwd`: the session's REAL working directory, from
+ * the transcript's own `cwd` field or the bound pane's process cwd. Null only
+ * when neither was available, and then the applier falls back to decoding the
+ * project dir name — a guess that cannot tell a `-` in a directory name from
+ * the `/` it encodes (issue #156).
+ */
 export type InitialBatchAction =
   | { type: "process-existing"; sessionId: string; path: string }
   | {
@@ -206,6 +228,8 @@ export type InitialBatchAction =
       pid: number;
       provenance: BindingProvenance;
       confidence: BindingConfidence;
+      /** The session's real cwd, when known; see the type's doc comment. */
+      cwd: string | null;
     }
   | {
       /**
@@ -216,6 +240,8 @@ export type InitialBatchAction =
       type: "create-unbound";
       sessionId: string;
       path: string;
+      /** The session's real cwd, when known; see the type's doc comment. */
+      cwd: string | null;
     }
   | {
       type: "replace";
@@ -225,6 +251,8 @@ export type InitialBatchAction =
       path: string;
       paneId: string;
       pid: number;
+      /** The session's real cwd, when known; see the type's doc comment. */
+      cwd: string | null;
     }
   | { type: "skip"; path: string };
 
@@ -238,6 +266,8 @@ export interface InitialBatchDecision {
 export interface MigrationObservation {
   processes: readonly ProcessInfo[];
   panes: readonly TmuxPane[];
+  /** Enables the pairing's ancestry fallback; see `NewSessionPaneObservation`. */
+  processTree?: ProcessTreeLike;
   /** All marker files (pid → session identity), boot snapshot. */
   markers: readonly { session_id: string; pid: number }[];
   /** Parsed history.jsonl entries (raw project paths). */

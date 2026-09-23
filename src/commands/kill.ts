@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { getDaemonUrl } from "../lib/config";
+import { daemonError, readBoolean } from "../lib/daemon-json";
 import { ensureDaemon } from "./shared";
 
 export function createKillCommand(): Command {
@@ -21,13 +22,24 @@ export function createKillCommand(): Command {
         }
 
         if (response.status === 400) {
-          const data = (await response.json()) as { error: string };
-          console.error(data.error);
+          const error = await daemonError(response);
+          console.error(error ?? `HTTP ${response.status}`);
           process.exit(1);
         }
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
+        }
+
+        // `killed: false` means the process outlived the daemon's wait and is
+        // still running. A background row omits the field, so absent is success.
+        const body: unknown = await response.json();
+
+        if (readBoolean(body, "killed") === false) {
+          console.error(
+            `Session ${sessionId} did not exit; the process is still running.`,
+          );
+          process.exit(1);
         }
 
         console.log(`Killed session: ${sessionId}`);

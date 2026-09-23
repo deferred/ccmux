@@ -17,6 +17,8 @@ import {
 } from "../../lib/preferences";
 import type { EnrichedSession, BranchPR } from "../../types";
 import { displayWidth, sliceToWidth, truncateText } from "../utils/format";
+import { stripTerminalNoise } from "../../lib/strip-ansi";
+import { HANDOFF_PREFIX } from "../../daemon/handoff";
 
 const RESPONSIVE_KEYS = new Set([
   "default",
@@ -174,14 +176,14 @@ const DEFAULT_COLUMNS: ColumnsConfig = {
     },
   },
   // Row 2 renders only when some field has data (see `rowHasContent`), so
-  // sessions with no prompt stay single-line. `pr` is right-aligned branch
-  // metadata; the prompt cell shrinks (see SessionItem) so long prompts
-  // truncate instead of pushing the PR ids off-screen. The `PR ` prefix is
+  // sessions with nothing to subtitle stay single-line. `pr` is right-aligned
+  // branch metadata; the summary cell shrinks (see SessionItem) so long text
+  // truncates instead of pushing the PR ids off-screen. The `PR ` prefix is
   // dropped (`short`) below the `lg` breakpoint to save room on smaller
   // screens; inline collapse drops it too (see `flattenToRow1`), so the bare
   // colored `#id` rides next to the branch instead of reading as "PR".
   row2: {
-    left: ["prompt"],
+    left: ["summary"],
     right: [{ field: "pr", mode: { default: "short", lg: "full" } }],
   },
 };
@@ -191,7 +193,7 @@ const DEFAULT_COLUMNS: ColumnsConfig = {
  * session-level metadata that must survive the `p` toggle and the
  * no-prompt collapse: PR rides row 1 (in `short` mode — the `PR ` prefix
  * is too wide for a 30-col rail) next to the agent code. Row 2 is the
- * per-turn activity line (prompt + time); the pane target is dropped from
+ * per-turn activity line (summary + time); the pane target is dropped from
  * the defaults since selection, not the address, drives navigation —
  * restorable via `sidebar.columns`.
  */
@@ -201,7 +203,7 @@ export const SIDEBAR_DEFAULT_COLUMNS: ColumnsConfig = {
     right: ["pr:short", "agent:short"],
   },
   row2: {
-    left: ["prompt"],
+    left: ["summary"],
     right: ["time"],
   },
 };
@@ -265,16 +267,22 @@ export function resolveLayout(
 }
 
 /**
- * Drop the prompt entirely (the `off` prompt mode): row 2 is dropped
+ * Drop the per-turn text entirely (the `off` prompt mode): row 2 is dropped
  * wholesale (density is the point of turning it off, so the PR cell goes
- * too), and a prompt placed on row 1 by a custom layout is stripped as well.
+ * too), and a flexible text cell placed on row 1 by a custom layout is
+ * stripped as well.
+ *
+ * BOTH flexible cells go, not just `prompt`: `summary` falls back to the
+ * prompt, so leaving it behind would keep showing the very text the toggle
+ * was pressed to hide.
  */
 export function stripPrompt(cols: ResolvedColumns): ResolvedColumns {
+  // Both flexible text cells go: `summary` falls back to the prompt, so
+  // leaving it behind would keep showing the very text the toggle turned off.
+  const drop = (entries: ResolvedEntry[]) =>
+    entries.filter((e) => !isFlexTextField(e.field));
   return {
-    row1: {
-      left: cols.row1.left.filter((e) => e.field !== "prompt"),
-      right: cols.row1.right.filter((e) => e.field !== "prompt"),
-    },
+    row1: { left: drop(cols.row1.left), right: drop(cols.row1.right) },
     row2: { left: [], right: [] },
   };
 }
@@ -283,7 +291,7 @@ export function stripPrompt(cols: ResolvedColumns): ResolvedColumns {
  * Collapse row 2 onto row 1 for single-line (`inline`) display: every row-2
  * entry joins the end of the matching row-1 side, and row 2 is emptied. The
  * prompt cell flexes to fill row 1's middle gap (see SessionItem's
- * `promptOnRow` handling), so the per-turn subtitle rides the identity line
+ * `flexOnRow` handling), so the per-turn subtitle rides the identity line
  * instead of earning its own row.
  */
 function flattenToRow1(cols: ResolvedColumns): ResolvedColumns {
@@ -291,13 +299,28 @@ function flattenToRow1(cols: ResolvedColumns): ResolvedColumns {
   // reads as the branch metadata it is, rather than floating past the
   // timestamp at the far right; the prompt becomes the flexible filler at the
   // end of the left side. A field already on row 1 is dropped so nothing is
-  // doubled (a custom `prompt` on row 1 plus the default `row2: [prompt]`
-  // would otherwise render it twice, putting two flex fillers on one row).
+  // doubled.
   const present = new Set(
     [...cols.row1.left, ...cols.row1.right].map((e) => e.field),
   );
+  // The collapsed row can hold ONE flexible text cell: they share a single
+  // budget, and a second one leaves both too narrow to read. So the slot is
+  // claimed once and every later flex field is dropped, whichever name it
+  // goes by. That covers both ways a second one arrives: row 1 already
+  // carrying one (a custom `row1.left: [prompt]` against the default
+  // `row2.left: [summary]` is two names for the same filler), and row 2
+  // carrying two of its own (`row2.left: [summary, prompt]`).
+  //
+  // Stateful, so the order here has to match the assembly order below: `meta`
+  // is filtered first and lands first, ahead of `prompt`.
+  let flexTaken = rowHasFlexText(cols.row1);
   const fresh = (entries: ResolvedEntry[]) =>
-    entries.filter((e) => !present.has(e.field));
+    entries.filter((e) => {
+      if (!isFlexTextField(e.field)) return !present.has(e.field);
+      if (flexTaken) return false;
+      flexTaken = true;
+      return true;
+    });
   const meta = fresh(cols.row2.right);
   const prompt = fresh(cols.row2.left);
   const projectIdx = cols.row1.left.findIndex((e) => e.field === "project");
@@ -340,32 +363,90 @@ export function applyPromptDisplay(
 
 /**
  * Claude logs store slash-command turns as XML-ish markup
- * (`<command-name>/clear</command-name><command-args>…</command-args>`) and
- * local-command output wrapped in `<local-command-stdout>`. Reduce those to
- * the command line / inner text so the subtitle reads as the user's intent.
+ * (`<command-name>/clear</command-name><command-args>…</command-args>`),
+ * local-command output wrapped in `<local-command-stdout>` (which can carry
+ * ANSI escapes straight from the terminal), and background-task completions
+ * wrapped in `<task-notification>` (only the `<summary>` inside is worth
+ * showing; a notification with none is dropped rather than shown raw).
+ * Reduce those to the text that reads as the user's intent.
+ *
+ * A `!` shell turn is a THIRD pair of shapes, not the local-command one:
+ * Claude Code 2.1.x writes the command as `<bash-input>` and its result as
+ * `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>`, and reserves
+ * `<local-command-stdout>` for built-ins like `/model`. The bash pair is
+ * where raw escapes actually arrive, since the payload is a real command's
+ * output. stdout wins over input when one text carries both, and stderr is
+ * the fallback for a command that only complained; a turn with neither
+ * reduces to "" so the row drops like the other empty shapes. `<bash-input>`
+ * renders with its `!` restored, the shape Claude's own last-prompt records
+ * use.
+ *
+ * ORDER IS THE POLICY, not a formality. `<task-notification>` is tested
+ * FIRST because it is the outermost wrapper: its `<result>` carries an
+ * agent's own prose, which can quote any of the tags below it. Tested last,
+ * a notification that mentioned `<bash-stdout>` would be answered by the
+ * bash branch reading the quote. Every other shape is a leaf, so among them
+ * order is only the stdout-beats-input preference above.
+ *
+ * `stripTerminalNoise` is what makes an escape-carrying payload paintable;
+ * its own comment carries the why.
  */
 function stripCommandMarkup(text: string): string {
-  const command = text.match(/<command-name>(.*?)<\/command-name>/);
+  const notification = text.match(
+    /<task-notification>([\s\S]*?)<\/task-notification>/,
+  );
+  if (notification) {
+    const summary = notification[1].match(/<summary>([\s\S]*?)<\/summary>/);
+    return summary ? summary[1] : "";
+  }
+  const command = text.match(/<command-name>([\s\S]*?)<\/command-name>/);
   if (command) {
-    const args = text.match(/<command-args>(.*?)<\/command-args>/);
+    const args = text.match(/<command-args>([\s\S]*?)<\/command-args>/);
     return [command[1], args?.[1]].filter(Boolean).join(" ");
   }
   const stdout = text.match(
-    /<local-command-stdout>(.*?)<\/local-command-stdout>/,
+    /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/,
   );
-  if (stdout) return stdout[1];
+  if (stdout) return stripTerminalNoise(stdout[1]);
+  const bashOut = text.match(/<bash-stdout>([\s\S]*?)<\/bash-stdout>/);
+  const bashErr = text.match(/<bash-stderr>([\s\S]*?)<\/bash-stderr>/);
+  if (bashOut || bashErr)
+    return (
+      stripTerminalNoise(bashOut?.[1] ?? "") ||
+      stripTerminalNoise(bashErr?.[1] ?? "")
+    );
+  const bashIn = text.match(/<bash-input>([\s\S]*?)<\/bash-input>/);
+  if (bashIn) {
+    const cmd = stripTerminalNoise(bashIn[1]);
+    return cmd ? `! ${cmd}` : "";
+  }
   return text;
+}
+
+/**
+ * A relayed `[ccmux handoff]` message (see `daemon/handoff.ts`) is the
+ * frozen provenance header, a blank line, then the payload a peer session
+ * actually sent. Surface the payload, not the header, as the prompt.
+ */
+function stripHandoffHeader(text: string): string {
+  if (!text.startsWith(HANDOFF_PREFIX)) return text;
+  const separator = text.indexOf("\n\n");
+  return separator === -1 ? "" : text.slice(separator + 2);
 }
 
 /**
  * The prompt as the subtitle renders it. Lives here (not SessionItem) so
  * `hasFieldData` can apply the same reduction: a prompt that normalizes
- * to "" (whitespace-only, or empty-inner markup like a quiet
- * `<local-command-stdout></local-command-stdout>`) must not earn row 2 a
- * line it would render blank.
+ * to "" (whitespace-only, empty-inner markup like a quiet
+ * `<local-command-stdout></local-command-stdout>`, or a task notification
+ * with no summary) must not earn row 2 a line it would render blank.
+ *
+ * The handoff header is stripped before whitespace is collapsed: its
+ * header/payload boundary is a blank line, which collapsing would destroy.
  */
 export function normalizePrompt(text: string): string {
-  return stripCommandMarkup(text.replace(/\s+/g, " ").trim()).trim();
+  const payload = stripHandoffHeader(text.trim());
+  return stripCommandMarkup(payload.replace(/\s+/g, " ").trim()).trim();
 }
 
 /**
@@ -428,7 +509,14 @@ export function prLabel(session: EnrichedSession, mode?: string): string {
   return mode === "short" ? ids : `PR ${ids}`;
 }
 
-/** Whether a single field has displayable data on this session. */
+/**
+ * Whether a single field has displayable data on this session.
+ *
+ * Nothing here knows about the wrapped prompt block: a row that would only
+ * repeat the block's own text drops the cell from its LAYOUT instead (see
+ * `withoutFlexText` and SessionList's per-row choice), so both the measured
+ * height and the drawn row read one object rather than agreeing by hand.
+ */
 export function hasFieldData(
   session: EnrichedSession,
   field: ColumnField,
@@ -456,6 +544,12 @@ export function hasFieldData(
       return !!session.gitBranch;
     case "pr":
       return sessionPRs(session).length > 0;
+    case "summary":
+      // The cell falls back to the prompt, so it has data whenever either
+      // does. The daemon ships `summary` already normalized; `!= null` also
+      // covers a daemon too old to ship it at all, whose `undefined` means
+      // no summary rather than one this cell should try to render.
+      return session.summary != null || hasFieldData(session, "prompt");
   }
 }
 
@@ -474,12 +568,104 @@ export function rowHasContent(
   return row.left.some(counts) || row.right.some(counts);
 }
 
-/** Whether the prompt cell lands on this resolved row (either side). */
-export function rowHasPrompt(row: ResolvedRow): boolean {
+/**
+ * Fields that flex to fill their row rather than occupying a fixed width:
+ * free text of unbounded length, truncated to whatever the row has left.
+ * They share one budget, so a row should carry at most one of them.
+ */
+export function isFlexTextField(field: ColumnField): boolean {
+  return field === "prompt" || field === "summary";
+}
+
+/** Whether a flexible text cell lands on this resolved row (either side). */
+export function rowHasFlexText(row: ResolvedRow): boolean {
   return (
-    row.left.some((e) => e.field === "prompt") ||
-    row.right.some((e) => e.field === "prompt")
+    row.left.some((e) => isFlexTextField(e.field)) ||
+    row.right.some((e) => isFlexTextField(e.field))
   );
+}
+
+/**
+ * Drop every `prompt` cell from both rows, leaving the rest of each row
+ * intact, `summary` included. Unlike `stripPrompt`, which also clears row 2
+ * wholesale because `promptDisplay: "off"` means "no per-turn text anywhere,
+ * collapse the row".
+ *
+ * Used when the wrapped prompt block is DRAWN and the row has a real summary
+ * to keep: the block IS the prompt, so a `prompt` column alongside it would
+ * print the same text twice, while the summary is different text and earns
+ * its place on the identity line. A row whose agent wrote no summary takes
+ * `withoutFlexText` instead, since its `summary` cell could only fall back to
+ * the block's own text. SessionList picks between the two per session.
+ *
+ * Whenever the block yields entirely (a search is active, `promptDisplay:
+ * "off"`, or a rail too narrow for a readable block), neither applies and the
+ * one-line cell comes back.
+ */
+export function withoutPrompt(cols: ResolvedColumns): ResolvedColumns {
+  return withoutFields(cols, (field) => field === "prompt");
+}
+
+/**
+ * Drop BOTH flexible text cells from both rows: the `prompt` the block
+ * replaces and the `summary` that would fall back to it.
+ *
+ * The per-ROW half of the block's yield rule, chosen per session by
+ * SessionList: a row whose agent wrote no summary has a `summary` cell that
+ * can only print the block's own text, so that row lays out without it. A row
+ * whose agent DID write one keeps `withoutPrompt`'s layout, summary on the
+ * identity line and the block below.
+ */
+export function withoutFlexText(cols: ResolvedColumns): ResolvedColumns {
+  return withoutFields(cols, isFlexTextField);
+}
+
+function withoutFields(
+  cols: ResolvedColumns,
+  drop: (field: ColumnField) => boolean,
+): ResolvedColumns {
+  const keep = (entries: ResolvedEntry[]) =>
+    entries.filter((e) => !drop(e.field));
+  return {
+    row1: { left: keep(cols.row1.left), right: keep(cols.row1.right) },
+    row2: { left: keep(cols.row2.left), right: keep(cols.row2.right) },
+  };
+}
+
+/** Columns the wrapped prompt block is inset from the row's left edge, so it
+ *  reads as belonging to the row above rather than as a row of its own. */
+export const PROMPT_BLOCK_INDENT = 2;
+
+/**
+ * One shared array for every row that has no block, so a row whose block is
+ * off never re-keys the `<For>` that draws it on an identity-only change.
+ */
+export const EMPTY_PROMPT_BLOCK: string[] = [];
+
+/**
+ * Narrowest block worth drawing. Below this the wrap is more hyphen-less
+ * word fragment than prose, so the caller drops the block and lets the
+ * one-line `prompt` cell have the row instead.
+ */
+export const PROMPT_BLOCK_MIN_WIDTH = 8;
+
+/**
+ * Usable width for the wrapped prompt block at a given row width.
+ *
+ * Shared so the wrap and the box it is drawn in cannot be computed from two
+ * different ideas of the geometry — a disagreement here is an off-by-one in
+ * the row height, which the scroll math would then carry into every row
+ * below it.
+ *
+ * Reports the REAL width, which on a very narrow rail can be tiny or even
+ * negative; clamping it up would wrap to a width wider than the box it is
+ * drawn in. Callers compare against {@link PROMPT_BLOCK_MIN_WIDTH} and skip
+ * the block entirely rather than draw one that cannot fit.
+ */
+export function promptBlockWidth(totalWidth: number): number {
+  const PADDING = 2; // the item's own paddingLeft + paddingRight
+  const SCROLLBAR = 3; // the scrollbox gutter the terminal width hides
+  return totalWidth - PADDING - PROMPT_BLOCK_INDENT - SCROLLBAR;
 }
 
 /** Max rendered width of an attention label before it is ellipsized. */

@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, rmSync, readFileSync, existsSync, readdirSync } from "fs";
+import {
+  mkdirSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -95,12 +102,16 @@ afterEach(() => {
 });
 
 describe("makePlugin: eager seed", () => {
-  it("writes one marker per persisted session with status-derived state", async () => {
+  it("writes one marker per hosted session with status-derived state", async () => {
+    // `s4` is listed but has no status entry: `session.list` is project-wide
+    // over the shared db, so it also returns history and sibling processes'
+    // sessions. Only the three this server reports a status for are ours.
     const client = makeClient(
       [
         { id: "s1", directory: "/tmp/a", title: "Alpha" },
         { id: "s2", directory: "/tmp/b", title: "Beta" },
         { id: "s3", directory: "/tmp/c", title: "Gamma" },
+        { id: "s4", directory: "/tmp/d", title: "Delta" },
       ],
       {
         s1: { type: "idle" },
@@ -131,6 +142,7 @@ describe("makePlugin: eager seed", () => {
     });
     expect(m2).toMatchObject({ state: "working", title: "Beta" });
     expect(m3).toMatchObject({ state: "working", title: "Gamma" });
+    expect(readMarker(markersDir, "s4")).toBeNull();
   });
 
   it("writes state_timestamp with sub-second precision from the injected clock", async () => {
@@ -154,7 +166,11 @@ describe("makePlugin: eager seed", () => {
     expect(m1?.timestamp).toBeCloseTo(1_700_000_000.123, 3);
   });
 
-  it("defaults to idle when a session has no status entry", async () => {
+  it("skips a listed session this server reports no status for", async () => {
+    // No status entry means this process is not running the session (the
+    // status map is per-process and idle entries are deleted), so claiming
+    // it with our pid would be a false hosting claim. The skip must also
+    // leave `sessionState` unprimed: a later status event still writes.
     const client = makeClient(
       [{ id: "s1", directory: "/tmp/a", title: "Alpha" }],
       {},
@@ -163,7 +179,53 @@ describe("makePlugin: eager seed", () => {
     const hooks = await plugin({ client });
     await awaitSeed(hooks);
 
-    expect(readMarker(markersDir, "s1")).toMatchObject({ state: "idle" });
+    expect(readMarker(markersDir, "s1")).toBeNull();
+
+    await dispatchAll(hooks, [
+      {
+        type: "session.status",
+        properties: { sessionID: "s1", status: { type: "busy" } },
+      },
+    ]);
+    expect(readMarker(markersDir, "s1")).toMatchObject({ state: "working" });
+  });
+
+  it("leaves a sibling process's marker byte-identical (issue #177)", async () => {
+    // Two `opencode` processes in one directory share the SQLite db, so
+    // `session.list` here returns the OTHER process's live session. Its
+    // marker already carries that process's pid and last_prompt; a blanket
+    // seed rewrote both, stealing the row and dropping the prompt.
+    mkdirSync(markersDir, { recursive: true });
+    const foreignPath = join(markersDir, "opencode-ses_foreign.json");
+    const foreignBody = JSON.stringify({
+      agent_type: "opencode",
+      pid: process.pid + 1,
+      session_id: "ses_foreign",
+      timestamp: 1_700_000_000.5,
+      state_timestamp: 1_700_000_000.5,
+      state: "working",
+      directory: "/tmp/shared",
+      title: "Sibling session",
+      last_prompt: "sibling's prompt",
+    });
+    writeFileSync(foreignPath, foreignBody);
+
+    const client = makeClient(
+      [
+        { id: "ses_foreign", directory: "/tmp/shared", title: "Renamed" },
+        { id: "ses_mine", directory: "/tmp/shared", title: "Mine" },
+      ],
+      { ses_mine: { type: "busy" } },
+    );
+    const plugin = makePlugin({ markersDir, version: "1.0.0" });
+    const hooks = await plugin({ client, directory: "/tmp/shared" });
+    await awaitSeed(hooks);
+
+    expect(readFileSync(foreignPath, "utf-8")).toBe(foreignBody);
+    expect(readMarker(markersDir, "ses_mine")).toMatchObject({
+      state: "working",
+      pid: process.pid,
+    });
   });
 
   it("logs-and-continues when session.list rejects", async () => {
@@ -360,6 +422,155 @@ describe("makePlugin: bus event dispatch", () => {
     });
   });
 
+  // Payload shapes below mirror a live capture from OpenCode 1.18.15
+  // (issue #137): `sessionID` top-level, `questions` an array of
+  // {question, header, options}, replies referencing `requestID`.
+  it("question.asked sets waiting_question with the question text as context", async () => {
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "session.created",
+        properties: { info: { id: "s1", directory: "/r", title: "t" } },
+      },
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [
+            {
+              question: "Which color do you prefer?",
+              header: "Color preference",
+              options: [{ label: "Red", description: "Prefer red" }],
+            },
+          ],
+          tool: { messageID: "msg_1", callID: "call_1" },
+        },
+      },
+    ]);
+    const m = readMarker(markersDir, "s1");
+    expect(m).toMatchObject({
+      state: "waiting_question",
+      pending_tool: null,
+      permission_context: "Which color do you prefer?",
+    });
+  });
+
+  it("multi-question asks annotate the context with the remainder count", async () => {
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [
+            { question: "First?", header: "A", options: [] },
+            { question: "Second?", header: "B", options: [] },
+          ],
+        },
+      },
+    ]);
+    expect(readMarker(markersDir, "s1")?.permission_context).toBe(
+      "First? (+1 more)",
+    );
+  });
+
+  it("question.replied flips to working and clears the context", async () => {
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [{ question: "Which?", header: "H", options: [] }],
+        },
+      },
+      {
+        type: "question.replied",
+        properties: { sessionID: "s1", requestID: "que_1", answers: [["A"]] },
+      },
+    ]);
+    const m = readMarker(markersDir, "s1");
+    expect(m).toMatchObject({
+      state: "working",
+      pending_tool: null,
+      permission_context: null,
+    });
+  });
+
+  it("question.rejected flips to working like a reply", async () => {
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [{ question: "Which?", header: "H", options: [] }],
+        },
+      },
+      {
+        type: "question.rejected",
+        properties: { sessionID: "s1", requestID: "que_1" },
+      },
+    ]);
+    expect(readMarker(markersDir, "s1")?.state).toBe("working");
+  });
+
+  it("a missed reply self-heals on the next session.status idle", async () => {
+    // The documented recovery path: without it, a dropped `question.replied`
+    // would leave the row at `waiting` forever.
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [{ question: "Which?", header: "H", options: [] }],
+        },
+      },
+    ]);
+    expect(readMarker(markersDir, "s1")?.state).toBe("waiting_question");
+
+    await dispatchAll(hooks, [
+      {
+        type: "session.status",
+        properties: { sessionID: "s1", status: { type: "idle" } },
+      },
+    ]);
+    expect(readMarker(markersDir, "s1")?.state).toBe("idle");
+  });
+
+  it("session.updated mid-question preserves waiting_question", async () => {
+    // Observed live: OpenCode renames the session title while the question
+    // picker is open. The `prior?.state` carry in `session.updated` must not
+    // reset the wait.
+    const { hooks } = await setup();
+    await dispatchAll(hooks, [
+      {
+        type: "session.created",
+        properties: { info: { id: "s1", directory: "/r", title: "t" } },
+      },
+      {
+        type: "question.asked",
+        properties: {
+          id: "que_1",
+          sessionID: "s1",
+          questions: [{ question: "Which?", header: "H", options: [] }],
+        },
+      },
+      {
+        type: "session.updated",
+        properties: { info: { id: "s1", directory: "/r", title: "renamed" } },
+      },
+    ]);
+    const m = readMarker(markersDir, "s1");
+    expect(m).toMatchObject({ state: "waiting_question", title: "renamed" });
+  });
+
   it("session.deleted unlinks the marker", async () => {
     const { hooks } = await setup();
     await dispatchAll(hooks, [
@@ -380,11 +591,9 @@ describe("makePlugin: bus event dispatch", () => {
 
   it("ignores unknown event types without throwing", async () => {
     const { hooks } = await setup();
-    await expect(
-      hooks.event({
-        event: { type: "totally.unknown", properties: {} },
-      }),
-    ).resolves.toBeUndefined();
+    await hooks.event({
+      event: { type: "totally.unknown", properties: {} },
+    });
   });
 
   it("ignores malformed events missing required fields", async () => {

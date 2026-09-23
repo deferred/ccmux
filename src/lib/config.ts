@@ -149,11 +149,13 @@ export const CURSOR_HOOKS_FILE = join(CURSOR_DIR, "hooks.json");
 /**
  * pi's own directory. Read-only except during `ccmux setup --agent pi`,
  * which drops a bundled JS extension into the auto-discovered extensions
- * dir. pi resolves this dir as `~/.pi/agent` unconditionally (no XDG/env
- * override; source: pi `config.ts` `getAgentDir()` -> `join(homedir(),
- * ".pi", "agent")`).
+ * dir. Honors Pi's `PI_CODING_AGENT_DIR` override.
  */
-export const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+export function getPiAgentDir(agentDir: string | undefined): string {
+  return agentDir ? expandHome(agentDir) : join(homedir(), ".pi", "agent");
+}
+
+export const PI_AGENT_DIR = getPiAgentDir(process.env.PI_CODING_AGENT_DIR);
 export const PI_EXTENSION_DIR = join(PI_AGENT_DIR, "extensions");
 export const PI_EXTENSION_FILE = join(PI_EXTENSION_DIR, "ccmux.js");
 
@@ -162,10 +164,10 @@ export const PI_EXTENSION_FILE = join(PI_EXTENSION_DIR, "ccmux.js");
  * which drops a bundled JS extension into the auto-discovered extensions dir.
  * The `PI_CONFIG_DIR` join below is deliberately BUG-COMPATIBLE with omp,
  * which joins the env value verbatim, so do NOT "fix" this to `resolve()`:
- * that would write the extension somewhere omp never reads. Upstream pi does
- * not honor the env var, so the `PI_*` constants above stay unconditional
- * `~/.pi`. Further omp relocations (profile dirs, XDG state) are deliberately
- * not modeled; evidence in docs/agent-adapters.md#omp-specific-caveats.
+ * that would write the extension somewhere omp never reads. Pi's path is
+ * resolved separately above. Further omp relocations (profile dirs, XDG state)
+ * are deliberately not modeled; evidence in
+ * docs/agent-adapters.md#omp-specific-caveats.
  */
 export const OMP_AGENT_DIR = join(
   homedir(),
@@ -269,6 +271,25 @@ export const SCAN_DEGRADED_THRESHOLD = 10;
 export const WATCHER_DEBOUNCE_MS = 200;
 export const HEARTBEAT_INTERVAL_MS = 15000;
 export const HEALTH_CHECK_TIMEOUT_MS = 100;
+/**
+ * Second, longer `/health` budget, used ONLY after the first probe timed out.
+ *
+ * A daemon roughly half a second into boot has already bound the port (the
+ * Server starts at the top of `Daemon.start()`) but is still migrating
+ * sessions and replaying markers, so it accepts the connection and answers
+ * later than 100ms. Reading that as "not running" makes the caller print
+ * "Starting daemon..." and SIGTERM a perfectly healthy listener. A timeout
+ * means something ACCEPTED, so it is worth waiting for; a refused connection
+ * is not retried at all and the no-daemon path stays as fast as it was.
+ */
+export const HEALTH_RETRY_TIMEOUT_MS = 1000;
+/**
+ * Budget for the best-effort `/server-info` read that follows a successful
+ * `/health` probe on the auto-start path. Longer than the liveness probe
+ * because a slow answer here must never evict a live daemon: on timeout the
+ * caller treats the build as current.
+ */
+export const DAEMON_INFO_TIMEOUT_MS = 1000;
 
 /**
  * Pane activity threshold — pane silent longer than this means not actively working

@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 /**
  * @typedef {object} MarkerState
- * @property {"idle"|"working"|"waiting_permission"} [state]
+ * @property {"idle"|"working"|"waiting_permission"|"waiting_question"} [state]
  * @property {number} [state_timestamp] Float epoch seconds (sub-second
  *   precision, matching the jq-based hook scripts' `now`), so two sibling
  *   sessions updated within the same wall-clock second still order
@@ -50,8 +50,9 @@ export function makePlugin({ markersDir, version, now = Date.now }) {
   const writeQueues = new Map();
   /**
    * Last-written marker state per session. Keeps `session.updated` from
-   * clobbering an in-flight `working`/`waiting_permission` back to idle
-   * when a rename event arrives, and lets us suppress no-op writes when
+   * clobbering an in-flight `working`/`waiting_permission`/`waiting_question`
+   * back to idle when a rename event arrives (question asks trigger a title
+   * rename mid-wait, observed live), and lets us suppress no-op writes when
    * a bus event would produce a byte-identical marker.
    * @type {Map<string, MarkerState>}
    */
@@ -156,6 +157,17 @@ export function makePlugin({ markersDir, version, now = Date.now }) {
     return "working";
   }
 
+  /**
+   * Seed markers at boot for the sessions THIS server hosts. A marker's
+   * `pid` is a hosting claim, and `session.list` is project-wide over the
+   * SQLite db every process in the directory shares (history plus sibling
+   * processes' live sessions), so seeding from it rewrote a sibling's live
+   * marker under our pid (issue #177). `client.session.status` is the only
+   * per-process evidence: `SessionStatus.list()` is this server's in-memory
+   * map, idle entries deleted, so an entry exists only for a session this
+   * process is running. Membership, not the entry's value, is the gate; a
+   * skipped session's first bus event writes its marker normally.
+   */
   async function eagerSeed(client, directory) {
     const [listRes, statusRes] = await Promise.all([
       client.session.list({ query: { directory } }).catch((err) => {
@@ -174,15 +186,17 @@ export function makePlugin({ markersDir, version, now = Date.now }) {
     /** @type {Record<string, OpencodeSessionStatus>} */
     const statusMap = (statusRes && statusRes.data) || {};
 
-    const writes = sessions.map((s) =>
-      queueWrite(s.id, () =>
-        writeMerged(s.id, {
-          state: stateFromStatus(statusMap[s.id]),
-          directory: s.directory,
-          title: s.title,
-        }),
-      ),
-    );
+    const writes = sessions
+      .filter((s) => Object.hasOwn(statusMap, s.id))
+      .map((s) =>
+        queueWrite(s.id, () =>
+          writeMerged(s.id, {
+            state: stateFromStatus(statusMap[s.id]),
+            directory: s.directory,
+            title: s.title,
+          }),
+        ),
+      );
     await Promise.all(writes);
   }
 
@@ -271,6 +285,46 @@ export function makePlugin({ markersDir, version, now = Date.now }) {
           }),
         );
       }
+
+      // The `question` tool blocks the turn on a pending deferred exactly
+      // like permissions do, but `session.status` stays `busy` the whole
+      // time (verified live on OpenCode 1.18.15: no status event of any
+      // kind fires at ask time), so without these cases the session pins
+      // at `working` for as long as the picker is open. The unprefixed v1
+      // event names are what the plugin bus publishes; the `question.v2.*`
+      // family never reaches this hook.
+      case "question.asked": {
+        const { sessionID } = properties;
+        if (!sessionID) return;
+        return queueWrite(sessionID, () =>
+          writeMerged(sessionID, {
+            state: "waiting_question",
+            pending_tool: null,
+            permission_context: describeQuestion(properties),
+          }),
+        );
+      }
+
+      // Both resolutions land as `working`, mirroring `permission.replied`,
+      // and the next `session.status` corrects within ~100ms. Only an ANSWER
+      // actually resumes the turn; a REJECT ends it, so the `working` write
+      // there is a sub-second transient the status event supersedes rather
+      // than a claim that work resumed. Both settle, hence one arm for both.
+      // That status event is also the self-heal for a missed reply: nothing
+      // fires during the wait itself, so a stale `waiting_question` survives
+      // only until OpenCode next reports status.
+      case "question.replied":
+      case "question.rejected": {
+        const { sessionID } = properties;
+        if (!sessionID) return;
+        return queueWrite(sessionID, () =>
+          writeMerged(sessionID, {
+            state: "working",
+            pending_tool: null,
+            permission_context: null,
+          }),
+        );
+      }
     }
   }
 
@@ -329,6 +383,31 @@ function describePermission(properties) {
   }
   if (typeof properties?.permission === "string") return properties.permission;
   return null;
+}
+
+/**
+ * First question's text for a question.asked event, with a count suffix
+ * when the request carries more than one question. Payload shape verified
+ * live on OpenCode 1.18.15: `properties.questions` is an array of
+ * `{question, header, options}`.
+ *
+ * @param {any} properties
+ * @returns {string|null}
+ */
+function describeQuestion(properties) {
+  const questions = properties?.questions;
+  if (!Array.isArray(questions) || questions.length === 0) return null;
+  const first = questions[0];
+  const text =
+    typeof first?.question === "string"
+      ? first.question
+      : typeof first?.header === "string"
+        ? first.header
+        : null;
+  if (!text) return null;
+  return questions.length > 1
+    ? `${text} (+${questions.length - 1} more)`
+    : text;
 }
 
 const ccmuxPlugin = makePlugin({
